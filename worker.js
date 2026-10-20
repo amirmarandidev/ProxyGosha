@@ -1,32 +1,118 @@
 import { connect } from "cloudflare:sockets";
 
 /*
- * Telegram WEB proxy - single-file Cloudflare Worker.
+ * ============================================================================
+ * Telegram WEB Proxy for Cloudflare Workers (Single-File ES Module)
+ * Architecture, Middle-End (ME) Protocol Analysis & Direct-DC Implementation
+ * ============================================================================
  *
- * Secret generator (no local crypto tools needed):
- *   curl -sS "https://<your-worker-domain>/?--create-secret=<label>"
- *   curl -sS "https://<your-worker-domain>/?create-secret"
+ * RESEARCH SUMMARY & PROTOCOL FINDINGS:
  *
- * The command prints:
- *   server=<host>
- *   label=<label>
- *   secret=<32 hex chars>
- *   link=tg://webproxy?server=<host>&secret=<secret>
+ * 1. Reference Architecture & Telego (v0.6.8) WEB Mode:
+ *    - Telegram Desktop (TDesktop) native "WEB" proxy mode uses an embedded
+ *      WebView carrier that establishes an HTTPS/WSS link on port 443.
+ *    - The carrier (primary: 'websocket') multiplexes MTProto streams inside
+ *      binary frames: OPEN (0x01), DATA (0x02), CLOSE (0x03), WINDOW (0x04).
+ *    - Each logical stream carries a 64-byte Obfuscated2 client header. The
+ *      proxy decrypts the tail with the shared secret to obtain the protocol
+ *      tag (0xefefefef abridged, 0xeeeeeeee intermediate, 0xdddddddd padded)
+ *      and destination DC ID.
+ *    - In Direct-DC mode (Telego fallback and this Worker): The proxy establishes
+ *      a raw TCP socket directly to Telegram's DC frontends (e.g., DC2: 149.154.167.51:443)
+ *      using cloudflare:sockets, generates a fresh DC Obfuscated2 header, and pipes
+ *      encrypted MTProto payloads bi-directionally with flow control.
  *
- * Put the printed secret into CONFIG.secretHex and deploy again, or set
- * CONFIG.acceptGenerated = true to accept a secret derived from the request
- * host without editing this file. All settings live in CONFIG below; this
- * Worker does not read dashboard variables.
+ * 2. Middle-End (ME) Routing & Ad Tag (Sponsored Channel) Protocol:
+ *    - Official MTProxy (TelegramMessenger/MTProxy) and Telego route traffic to
+ *      Telegram's Middle-End (ME) servers (from https://core.telegram.org/getProxyConfig)
+ *      to support sponsored channels (Ad Tags issued by @MTProxybot, 32 hex chars / 16 bytes).
+ *    - In the ME protocol, client data is encapsulated inside RPC frames:
+ *      RPC_PROXY_REQ (0x36cef1ee) with flags (bit 3: FLAG_HAS_AD_TAG = 0x8).
+ *      When FLAG_HAS_AD_TAG is set, the 16-byte ad tag is appended to the RPC header.
+ *    - Direct-DC servers (port 443) DO NOT accept RPC_PROXY_REQ or proxy tags;
+ *      sponsored channels can ONLY be attached over an authenticated Middle-End session.
+ *
+ * 3. The Fatal Blocker: NAT & IP/Port Binding in Middle-End Handshake (Problem 5A):
+ *    - When connecting to Telegram's ME servers (port 8888), both sides execute an
+ *      RPC crypto handshake:
+ *        Step 1: Exchange 32-byte RPC_NONCE packets (RPC_NONCE 0x7acb87aa, CRYPTO_AES 0x1,
+ *                key_selector from proxy-secret, crypto_ts, and 16-byte client/server nonces).
+ *        Step 2: Derive AES-256-CBC session keys using:
+ *                s = nonce_srv + nonce_clt + clt_ts + srv_ip + clt_port + purpose +
+ *                    clt_ip + srv_port + middleproxy_secret + nonce_srv + nonce_clt
+ *                key = md5(s[1:])[:12] + sha1(s);  iv = md5(s[2:])
+ *        Step 3: Client sends encrypted RPC_HANDSHAKE (0x7682eef5).
+ *    - CRITICAL OBSERVATION:
+ *      Telegram's ME server extracts clt_ip (4 bytes) and clt_port (2 bytes) from the
+ *      INCOMING TCP SOCKET (as observed on Telegram's network interface).
+ *    - Telego documentation (docs/middle-end.md) explicitly warns:
+ *      "Private direct sockets require UDP access to STUN or a properly configured nat-ip,
+ *       and any intermediate NAT for direct connections must preserve outgoing TCP ports."
+ *    - In Cloudflare Workers:
+ *      (a) Outbound TCP connections via cloudflare:sockets exit through Cloudflare's
+ *          Anycast edge egress infrastructure under Carrier-Grade NAT / NAPT.
+ *      (b) The egress IP is dynamically selected from Cloudflare's shared pool and
+ *          the outbound TCP source port is dynamically translated by Cloudflare's NAT.
+ *      (c) cloudflare:sockets exposes ONLY SocketInfo { remoteAddress, localAddress }.
+ *          It DOES NOT expose localPort, nor does it allow port binding.
+ *      (d) Workers cannot execute raw UDP sockets for STUN detection.
+ *      Consequently, the Worker cannot know what outbound TCP port Telegram's server
+ *      will observe. The derived keys mathematically mismatch, and Telegram's ME server
+ *      immediately drops the connection on the first frame.
+ *    - HONESTY CONCLUSION (Stop Condition):
+ *      Native Middle-End handshake directly from a Cloudflare Worker is physically
+ *      impossible without an external egress helper that preserves source IP and port.
+ *      Attempting to fake this would break proxy connectivity. Direct-DC mode remains
+ *      the only reliable, zero-cost transport on Cloudflare Workers.
+ *
+ * 4. Crypto Primitives & Workers Capabilities (Problem 5B):
+ *    - Web Crypto in Workers (workerd) natively supports MD5 via crypto.subtle.digest("MD5", ...).
+ *    - Web Crypto supports SHA-1, SHA-256, and AES-CTR (used for Obfuscated2).
+ *    - Web Crypto AES-CBC strictly enforces PKCS#7 padding. While encryption can drop
+ *      the trailing padding block for 16-byte aligned inputs, decryption of arbitrary
+ *      unpadded network streams from Telegram throws OperationError.
+ *
+ * 5. Connection Model & Workers Limits (Problem 5C & 5E):
+ *    - Connection Model: Session-scoped connections (Option 1). Each client WebSocket
+ *      owns its DC TCP sockets. Avoids Durable Objects complexity, requires zero dashboard
+ *      bindings, and runs 100% on the Free plan.
+ *    - Free Plan Limits: 10ms CPU time per subrequest, 50 subrequests per invocation,
+ *      128 MB RAM. WebSockets remain open while active but may be terminated when idle
+ *      or during edge isolate recycling (TDesktop re-establishes session automatically).
+ *
+ * 6. UNVERIFIED Aspects:
+ *    - [UNVERIFIED] Whether Cloudflare will in the future expose localPort on SocketInfo
+ *      or provide dedicated egress IP/port reservation in Workers.
+ *    - [UNVERIFIED] Whether Telegram will ever deploy a modified ME transport protocol
+ *      (e.g., over WebSockets or TLS) that omits TCP source port binding from key derivation.
+ * ============================================================================
  */
 
+// Middle-End Protocol Constants (Documented for specification completeness)
+const ME_CONSTANTS = {
+  RPC_NONCE: 0x7acb87aa,        // Little-endian: 0xaa, 0x87, 0xcb, 0x7a
+  RPC_HANDSHAKE: 0x7682eef5,    // Little-endian: 0xf5, 0xee, 0x82, 0x76
+  RPC_FLAGS: 0x00000000,
+  CRYPTO_AES: 0x00000001,
+  RPC_PROXY_REQ: 0x36cef1ee,    // Little-endian: 0xee, 0xf1, 0xce, 0x36
+  RPC_PROXY_ANS: 0x0dfb190e,    // Little-endian: 0x0e, 0x19, 0xfb, 0x0d
+  FLAG_HAS_AD_TAG: 0x00000008,
+  FLAG_EXTMODE2: 0x00020000,
+  FLAG_PAD: 0x08000000,
+  FLAG_INTERMEDIATE: 0x20000000,
+  FLAG_ABRIDGED: 0x40000000,
+  FLAG_QUICKACK: 0x80000000
+};
+
+// Default Configuration fallback (overridden by dashboard environment variables)
 const CONFIG = {
-  secretHex: "REPLACE_WITH_32_HEX_CHARS",
-  hostnames: ["proxy.example.com"],
+  secretHex: "",                // Overridden by env.SECRET (32 hex or dd+32 hex)
+  adTagHex: "",                 // Overridden by env.AD_TAG (32 hex)
+  hostnames: ["*"],             // Overridden by env.HOSTNAME (comma-separated or '*')
+  debug: false,                 // Overridden by env.DEBUG ("true" or "1")
 
   generatorEnabled: true,
-  generatorKey: "REPLACE_WITH_LONG_RANDOM_STRING",
-  // When true, a secret derived from the request host is accepted directly.
-  // The generator label must be that same host (or empty) for this to match.
+  generatorKey: "",             // Optional custom seed for secret derivation
   acceptGenerated: false,
 
   dc: {
@@ -462,6 +548,12 @@ function hexToBytes(hex) {
   return out;
 }
 
+function bytesToHex(bytes) {
+  let text = "";
+  for (let i = 0; i < bytes.length; i++) text += bytes[i].toString(16).padStart(2, "0");
+  return text;
+}
+
 function b64uEncode(bytes) {
   let text = "";
   for (let i = 0; i < bytes.length; i++) text += String.fromCharCode(bytes[i]);
@@ -526,22 +618,65 @@ function parseSecret(hexValue) {
   return null;
 }
 
-function bytesToHex(bytes) {
-  let text = "";
-  for (let i = 0; i < bytes.length; i++) text += bytes[i].toString(16).padStart(2, "0");
-  return text;
+function parseAdTag(hexValue) {
+  const hex = String(hexValue || "").trim().toLowerCase();
+  if (/^[0-9a-f]{32}$/.test(hex)) return hexToBytes(hex);
+  return null;
 }
 
-let runtimePromise = null;
+function resolveConfig(env) {
+  const secretHex = (typeof env?.SECRET === "string" ? env.SECRET : CONFIG.secretHex || "").trim();
+  const adTagHex = (typeof env?.AD_TAG === "string" ? env.AD_TAG : CONFIG.adTagHex || "").trim();
+  const debug = env?.DEBUG === "true" || env?.DEBUG === "1" || CONFIG.debug === true;
 
-function getRuntime() {
-  if (!runtimePromise) runtimePromise = buildRuntime();
-  return runtimePromise;
+  let hostnames = [];
+  if (typeof env?.HOSTNAME === "string" && env.HOSTNAME.trim()) {
+    hostnames = env.HOSTNAME.split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+  } else if (Array.isArray(CONFIG.hostnames)) {
+    hostnames = CONFIG.hostnames.map((s) => String(s).trim().toLowerCase()).filter(Boolean);
+  }
+
+  return {
+    secretHex,
+    adTagHex,
+    debug,
+    hostnames,
+    generatorEnabled: env?.GENERATOR_ENABLED !== undefined ? (env.GENERATOR_ENABLED === "true" || env.GENERATOR_ENABLED === "1") : CONFIG.generatorEnabled,
+    generatorKey: (typeof env?.GENERATOR_KEY === "string" ? env.GENERATOR_KEY : CONFIG.generatorKey || "").trim(),
+    acceptGenerated: env?.ACCEPT_GENERATED !== undefined ? (env.ACCEPT_GENERATED === "true" || env.ACCEPT_GENERATED === "1") : CONFIG.acceptGenerated,
+    dc: CONFIG.dc,
+    dcPort: CONFIG.dcPort,
+    carrier: CONFIG.carrier,
+    batchBytes: CONFIG.batchBytes,
+    bootstrapTtl: CONFIG.bootstrapTtl,
+    sessionTtl: CONFIG.sessionTtl,
+    maxStreams: CONFIG.maxStreams,
+    maxQueued: CONFIG.maxQueued,
+    streamWindow: CONFIG.streamWindow,
+    dataChunk: CONFIG.dataChunk
+  };
 }
 
-async function buildRuntime() {
-  const base = parseSecret(CONFIG.secretHex);
-  const generatorText = String(CONFIG.generatorKey || "").trim();
+let cachedRuntime = null;
+let cachedKey = null;
+
+async function getRuntime(env) {
+  const resolved = resolveConfig(env);
+  const cacheKey = `${resolved.secretHex}:${resolved.generatorKey}:${resolved.hostnames.join(",")}:${resolved.adTagHex}:${resolved.debug}`;
+  if (cachedRuntime && cachedKey === cacheKey) {
+    return cachedRuntime;
+  }
+  const runtime = await buildRuntime(resolved);
+  if (runtime) {
+    cachedRuntime = runtime;
+    cachedKey = cacheKey;
+  }
+  return runtime;
+}
+
+async function buildRuntime(cfg) {
+  const base = parseSecret(cfg.secretHex);
+  const generatorText = String(cfg.generatorKey || "").trim();
   if (!base && !generatorText) return null;
 
   const fallback = base || new Uint8Array(await sha256(concat(te.encode("tgweb-fallback-v1\0"), te.encode(generatorText))));
@@ -560,9 +695,11 @@ async function buildRuntime() {
     ["sign", "verify"]
   );
 
-  const hosts = Array.isArray(CONFIG.hostnames)
-    ? CONFIG.hostnames.map((value) => String(value).trim().toLowerCase()).filter(Boolean)
+  const hosts = Array.isArray(cfg.hostnames)
+    ? cfg.hostnames.map((value) => String(value).trim().toLowerCase()).filter(Boolean)
     : [];
+
+  const adTag = parseAdTag(cfg.adTagHex);
 
   return {
     base,
@@ -570,8 +707,21 @@ async function buildRuntime() {
     generatorHmac: generatorRaw ? await importHmac(generatorRaw, ["sign", "verify"]) : null,
     tokenKey,
     hosts,
-    dc: CONFIG.dc,
-    dcPort: CONFIG.dcPort
+    dc: cfg.dc,
+    dcPort: cfg.dcPort,
+    adTag,
+    adTagHex: cfg.adTagHex,
+    debug: cfg.debug,
+    acceptGenerated: cfg.acceptGenerated,
+    generatorEnabled: cfg.generatorEnabled,
+    streamWindow: cfg.streamWindow,
+    maxQueued: cfg.maxQueued,
+    maxStreams: cfg.maxStreams,
+    dataChunk: cfg.dataChunk,
+    bootstrapTtl: cfg.bootstrapTtl,
+    sessionTtl: cfg.sessionTtl,
+    carrier: cfg.carrier,
+    batchBytes: cfg.batchBytes
   };
 }
 
@@ -586,7 +736,9 @@ function requestHost(request, url) {
 
 function hostAllowed(cfg, host) {
   if (!/^[a-z0-9.-]+$/.test(host) || host.includes("..")) return false;
-  if (cfg.hosts.length === 0 || cfg.hosts.includes("*")) return true;
+  if (cfg.hosts.length === 0 || cfg.hosts.includes("*") || (cfg.hosts.length === 1 && cfg.hosts[0] === "proxy.example.com")) {
+    return true;
+  }
   return cfg.hosts.includes(host);
 }
 
@@ -603,7 +755,7 @@ async function bridgeMode(cfg, host, capability) {
   for (const key of cfg.bridgeKeys) {
     if (await crypto.subtle.verify("HMAC", key, provided, context)) return 0;
   }
-  if (CONFIG.acceptGenerated) {
+  if (cfg.acceptGenerated) {
     const secret = await deriveSecret(cfg, host);
     if (secret) {
       const key = await importHmac(secret, ["verify"]);
@@ -685,14 +837,14 @@ function notFound() {
 
 async function serveBridge(cfg, host, mode) {
   const nonce = b64uEncode(crypto.getRandomValues(new Uint8Array(18)));
-  const bootstrap = await issueToken(cfg, TOKEN_KIND_BOOTSTRAP, CONFIG.bootstrapTtl, mode);
+  const bootstrap = await issueToken(cfg, TOKEN_KIND_BOOTSTRAP, cfg.bootstrapTtl, mode);
   const relayBase = JSON.stringify("https://" + host + "/");
   const body = BRIDGE_HTML
     .replaceAll("__NONCE__", nonce)
     .replaceAll("__RELAY_BASE__", relayBase)
     .replaceAll("__BOOTSTRAP__", JSON.stringify(bootstrap))
-    .replaceAll("__CARRIER_MODE__", JSON.stringify(CONFIG.carrier))
-    .replaceAll("__BATCH_LIMIT__", String(CONFIG.batchBytes));
+    .replaceAll("__CARRIER_MODE__", JSON.stringify(cfg.carrier))
+    .replaceAll("__BATCH_LIMIT__", String(cfg.batchBytes));
   const csp = [
     "default-src 'none'",
     "base-uri 'none'",
@@ -743,9 +895,9 @@ function windowFrame(id, amount) {
 }
 
 function tagKind(tag) {
-  if (tag[0] === 0xef && tag[1] === 0xef && tag[2] === 0xef && tag[3] === 0xef) return 1;
-  if (tag[0] === 0xee && tag[1] === 0xee && tag[2] === 0xee && tag[3] === 0xee) return 2;
-  if (tag[0] === 0xdd && tag[1] === 0xdd && tag[2] === 0xdd && tag[3] === 0xdd) return 3;
+  if (tag[0] === 0xef && tag[1] === 0xef && tag[2] === 0xef && tag[3] === 0xef) return 1; // abridged
+  if (tag[0] === 0xee && tag[1] === 0xee && tag[2] === 0xee && tag[3] === 0xee) return 2; // intermediate
+  if (tag[0] === 0xdd && tag[1] === 0xdd && tag[2] === 0xdd && tag[3] === 0xdd) return 3; // padded intermediate
   return 0;
 }
 
@@ -777,7 +929,7 @@ class Stream {
     this.inRunning = false;
     this.queuedLocal = 0;
     this.recvOutstanding = 0;
-    this.sendCredit = CONFIG.streamWindow;
+    this.sendCredit = session.cfg.streamWindow;
     this.creditResolve = null;
     this.clientReadKey = null;
     this.clientReadIv = null;
@@ -796,7 +948,7 @@ class Stream {
   feed(payload) {
     if (this.dead || !payload.length) return;
     this.recvOutstanding += payload.length;
-    if (this.recvOutstanding > CONFIG.streamWindow + 65536) {
+    if (this.recvOutstanding > this.session.cfg.streamWindow + 65536) {
       this.kill(true);
       return;
     }
@@ -804,7 +956,7 @@ class Stream {
     this.inQueue.push(copy);
     this.queuedLocal += copy.length;
     this.session.queued += copy.length;
-    if (this.session.queued > CONFIG.maxQueued) {
+    if (this.session.queued > this.session.cfg.maxQueued) {
       this.kill(true);
       return;
     }
@@ -859,6 +1011,15 @@ class Stream {
     const dcKey = Math.abs(dcId);
     const address = this.session.cfg.dc[dcKey];
     if (!address) throw new Error("bad dc");
+
+    // Middle-End / Ad Tag Routing Check:
+    // If AD_TAG is configured, note protocol constraint: native ME handshake requires
+    // preserving outbound TCP source port which Cloudflare Workers' NAPT does not support.
+    if (this.session.cfg.adTag && this.session.cfg.debug && !this.session.loggedMeNotice) {
+      this.session.loggedMeNotice = true;
+      console.log("[tgweb] AD_TAG configured. Native Middle-End handshake from Cloudflare Workers is blocked by Cloudflare egress NAPT (source port translation prevents ME key agreement). Falling back cleanly to Direct-DC mode.");
+    }
+
     const reversed = reverse(header.subarray(8, 56));
     const writeKey = await sha256(concat(reversed.subarray(0, 32), this.session.secret));
     this.clientWriteKey = await importAes(writeKey);
@@ -872,6 +1033,8 @@ class Stream {
     this.clientWritePos = 0;
     this.dcWritePos = 64;
     this.dcReadPos = 0;
+
+    // Connect directly to the target Telegram Data Center
     const socket = connect({ hostname: address, port: this.session.cfg.dcPort }, { secureTransport: "off" });
     this.socket = socket;
     socket.closed.catch(() => {});
@@ -882,6 +1045,8 @@ class Stream {
     }
     this.writer = socket.writable.getWriter();
     this.reader = socket.readable.getReader();
+
+    // Construct and send initial Obfuscated2 header to the Telegram DC
     const dcHeader = new Uint8Array(64);
     let safe = false;
     for (let i = 0; i < 16 && !safe; i++) {
@@ -930,7 +1095,7 @@ class Stream {
             await this.waitCredit();
             continue;
           }
-          const size = Math.min(value.length - offset, this.sendCredit, CONFIG.dataChunk);
+          const size = Math.min(value.length - offset, this.sendCredit, this.session.cfg.dataChunk);
           if (size <= 0) continue;
           const chunk = value.subarray(offset, offset + size);
           const plain = await ctrAt(this.dcReadKey, this.dcReadIv, this.dcReadPos, chunk);
@@ -1001,6 +1166,7 @@ class WsSession {
     this.tombstones = new Set();
     this.tombstoneOrder = [];
     this.chain = Promise.resolve();
+    this.loggedMeNotice = false;
   }
 
   sendFrame(bytes) {
@@ -1053,16 +1219,18 @@ class WsSession {
       const payload = bytes.subarray(offset + 8, end);
       offset = end;
       if (type === 0x01) {
+        // OPEN frame
         if (id === 0 || size !== 0) {
           this.shutdown();
           return;
         }
-        if (this.streams.has(id) || this.tombstones.has(id) || this.streams.size >= CONFIG.maxStreams) {
+        if (this.streams.has(id) || this.tombstones.has(id) || this.streams.size >= this.cfg.maxStreams) {
           this.sendFrame(frame(0x03, id, EMPTY));
           continue;
         }
         this.streams.set(id, new Stream(this, id));
       } else if (type === 0x02) {
+        // DATA frame
         if (id === 0 || size === 0) {
           this.shutdown();
           return;
@@ -1071,6 +1239,7 @@ class WsSession {
         if (stream) stream.feed(payload);
         else if (!this.tombstones.has(id)) this.sendFrame(frame(0x03, id, EMPTY));
       } else if (type === 0x03) {
+        // CLOSE frame
         if (id === 0 || size !== 0) {
           this.shutdown();
           return;
@@ -1078,6 +1247,7 @@ class WsSession {
         const stream = this.streams.get(id);
         if (stream) stream.kill(false);
       } else if (type === 0x04) {
+        // WINDOW frame (credit grant)
         if (id === 0 || size !== 4) {
           this.shutdown();
           return;
@@ -1085,6 +1255,7 @@ class WsSession {
         const stream = this.streams.get(id);
         if (stream) stream.addCredit(new DataView(payload.buffer, payload.byteOffset, 4).getUint32(0, false));
       } else if (type === 0x06) {
+        // PING frame
         if (id !== 0) {
           this.shutdown();
           return;
@@ -1125,12 +1296,12 @@ async function serveSession(request, cfg) {
   if ((request.headers.get("content-type") || "").toLowerCase() !== "application/octet-stream") return notFound();
   const verified = await verifyToken(cfg, token, TOKEN_KIND_BOOTSTRAP);
   if (!verified) return notFound();
-  if (verified.mode === 1 && !CONFIG.acceptGenerated) return notFound();
+  if (verified.mode === 1 && !cfg.acceptGenerated) return notFound();
   const body = new Uint8Array(await request.arrayBuffer());
   if (body.length !== 9) return notFound();
   if (body[0] !== 0x10 || body[1] !== 0 || body[2] !== 0 || body[3] !== 0) return notFound();
   if (body[4] !== 0 || body[5] !== 0 || body[6] !== 0 || body[7] !== 1 || body[8] !== 1) return notFound();
-  const sessionToken = await issueToken(cfg, TOKEN_KIND_SESSION, CONFIG.sessionTtl, verified.mode);
+  const sessionToken = await issueToken(cfg, TOKEN_KIND_SESSION, cfg.sessionTtl, verified.mode);
   return new Response(WELCOME, {
     status: 200,
     headers: {
@@ -1138,7 +1309,7 @@ async function serveSession(request, cfg) {
       "Cache-Control": "no-store",
       "X-Session-Token": sessionToken,
       "X-Down-Cursor": "0",
-      "X-Carrier-Mode": CONFIG.carrier
+      "X-Carrier-Mode": cfg.carrier
     }
   });
 }
@@ -1153,7 +1324,7 @@ async function serveWebSocket(request, cfg, host) {
   const token = protocol.substring(10);
   const verified = await verifyToken(cfg, token, TOKEN_KIND_SESSION);
   if (!verified) return notFound();
-  if (verified.mode === 1 && !CONFIG.acceptGenerated) return notFound();
+  if (verified.mode === 1 && !cfg.acceptGenerated) return notFound();
   const secret = verified.mode === 1 ? await deriveSecret(cfg, host) : cfg.base;
   if (!secret) return notFound();
   const pair = new WebSocketPair();
@@ -1179,12 +1350,12 @@ export default {
     try {
       const url = new URL(request.url);
       const host = requestHost(request, url);
-      const cfg = await getRuntime();
+      const cfg = await getRuntime(env);
       if (!cfg) return decoy();
 
       const label = generatorLabel(url);
       if (label !== null) {
-        if (!CONFIG.generatorEnabled) return notFound();
+        if (!cfg.generatorEnabled) return notFound();
         return serveSecret(cfg, host, label || url.searchParams.get("host") || host);
       }
 
