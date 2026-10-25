@@ -116,19 +116,20 @@ const CONFIG = {
   acceptGenerated: false,
 
   dc: {
-    1: "149.154.175.50",
-    2: "149.154.167.51",
-    3: "149.154.175.100",
-    4: "149.154.167.91",
-    5: "91.108.56.156",
-    203: "91.105.192.110"
+    1: ["149.154.175.50", "149.154.175.53", "149.154.175.54"],
+    2: ["149.154.167.51", "149.154.167.50", "149.154.167.40", "149.154.167.41"],
+    3: ["149.154.175.100", "149.154.175.101"],
+    4: ["149.154.167.91", "149.154.167.92", "149.154.167.90"],
+    5: ["91.108.56.156", "91.108.56.165", "91.108.56.170"],
+    203: ["91.105.192.110"]
   },
   dcPort: 443,
+  dcPorts: [443, 80, 5222],
   carrier: "websocket",
   batchBytes: 2097152,
   bootstrapTtl: 120,
   sessionTtl: 86400,
-  maxStreams: 32,
+  maxStreams: 6,                // Safe default for Cloudflare Workers Free plan socket limits
   maxQueued: 16777216,
   streamWindow: 4194304,
   dataChunk: 65536
@@ -142,10 +143,111 @@ const REQUEST_LIMIT = 16777216;
 
 const PERMISSIONS_POLICY = "accelerometer=(), autoplay=(), camera=(), clipboard-read=(), clipboard-write=(), display-capture=(), encrypted-media=(), fullscreen=(), geolocation=(), gyroscope=(), hid=(), idle-detection=(), magnetometer=(), microphone=(), midi=(), payment=(), picture-in-picture=(), publickey-credentials-create=(), publickey-credentials-get=(), screen-wake-lock=(), serial=(), usb=(), web-share=(), xr-spatial-tracking=()";
 
+// Realistic, modern edge telemetry landing page for anti-censorship camouflage (resists GFW / DPI active probing)
 const DECOY_HTML = `<!doctype html>
 <html lang="en">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Welcome</title></head>
-<body><h1>Welcome</h1><p>This site is online.</p></body>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>EdgeNode Network &mdash; Realtime Observability</title>
+  <style>
+    :root {
+      --bg: #0b0f19;
+      --card: #111827;
+      --text: #f3f4f6;
+      --muted: #9ca3af;
+      --primary: #3b82f6;
+      --success: #10b981;
+      --border: #1f2937;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background-color: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      line-height: 1.6;
+      padding: 0 1.5rem;
+    }
+    header {
+      max-width: 1040px;
+      margin: 0 auto;
+      padding: 2rem 0;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      border-bottom: 1px solid var(--border);
+    }
+    .logo { font-size: 1.25rem; font-weight: 700; color: #fff; display: flex; align-items: center; gap: 0.5rem; }
+    .status-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+      background: rgba(16, 185, 129, 0.1);
+      color: var(--success);
+      padding: 0.35rem 0.75rem;
+      border-radius: 9999px;
+      font-size: 0.85rem;
+      font-weight: 600;
+      border: 1px solid rgba(16, 185, 129, 0.2);
+    }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--success); box-shadow: 0 0 8px var(--success); }
+    main { max-width: 1040px; margin: 3rem auto; }
+    h1 { font-size: 2.25rem; font-weight: 800; margin-bottom: 1rem; line-height: 1.2; }
+    p.lead { font-size: 1.15rem; color: var(--muted); margin-bottom: 2.5rem; max-width: 680px; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 1.5rem; margin-bottom: 3rem; }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 0.75rem;
+      padding: 1.5rem;
+    }
+    .card h3 { font-size: 1.1rem; margin-bottom: 0.5rem; color: #fff; }
+    .card p { font-size: 0.95rem; color: var(--muted); }
+    .card .metric { font-size: 1.8rem; font-weight: 700; color: var(--primary); margin-top: 0.75rem; }
+    footer {
+      max-width: 1040px;
+      margin: 4rem auto 2rem;
+      padding-top: 2rem;
+      border-top: 1px solid var(--border);
+      text-align: center;
+      font-size: 0.85rem;
+      color: var(--muted);
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="logo">
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20"/><path d="M2 12h20"/></svg>
+      EdgeNode Telemetry
+    </div>
+    <div class="status-badge"><span class="dot"></span> All Systems Operational</div>
+  </header>
+  <main>
+    <h1>Global Edge Acceleration &amp; Telemetry</h1>
+    <p class="lead">Real-time edge distribution gateway operating high-throughput Anycast proxy routing, automated health checking, and transport latency monitoring.</p>
+    <div class="grid">
+      <div class="card">
+        <h3>Anycast Edge POPs</h3>
+        <p>Active routing instances across global tier-1 network exchanges.</p>
+        <div class="metric">310+ Nodes</div>
+      </div>
+      <div class="card">
+        <h3>Average Edge Latency</h3>
+        <p>Median connection turnaround for incoming transport streams.</p>
+        <div class="metric">&lt; 24 ms</div>
+      </div>
+      <div class="card">
+        <h3>Service Availability</h3>
+        <p>Rolling 30-day verified operational uptime across distributed clusters.</p>
+        <div class="metric">99.99%</div>
+      </div>
+    </div>
+  </main>
+  <footer>
+    &copy; 2026 EdgeNode Systems &bull; Enterprise Edge Telemetry &bull; Automated Monitoring
+  </footer>
+</body>
 </html>`;
 
 const WELCOME = new Uint8Array([0x11, 0, 0, 0, 0, 0, 0, 0]);
@@ -395,7 +497,13 @@ function openWebSocket(){
    port.postMessage({t:'traffic',up:0,down:event.data.byteLength});port.postMessage(event.data,[event.data]);status('connected');
   };
   socket.onerror=()=>reject(new Error('websocket failed'));
-  socket.onclose=()=>{if(!closed)fail()};
+  socket.onclose=()=>{
+   if(closed)return;
+   status('reconnecting');
+   setTimeout(()=>{
+    if(!closed)openWebSocket().then(()=>{status('connected');runWebSocketUp();}).catch(()=>fail());
+   },1500);
+  };
  });
 }
 function queueWebSocket(data){
@@ -611,7 +719,9 @@ async function ctrAt(key, iv, position, data) {
 }
 
 function parseSecret(hexValue) {
-  const hex = String(hexValue || "").trim().toLowerCase();
+  if (!hexValue) return null;
+  let hex = String(hexValue).trim().toLowerCase();
+  if (hex.startsWith("0x")) hex = hex.substring(2);
   if (!/^[0-9a-f]+$/.test(hex)) return null;
   if (hex.length === 32) return hexToBytes(hex);
   if (hex.length === 34 && hex.startsWith("dd")) return hexToBytes(hex.substring(2));
@@ -628,6 +738,7 @@ function resolveConfig(env) {
   const secretHex = (typeof env?.SECRET === "string" ? env.SECRET : CONFIG.secretHex || "").trim();
   const adTagHex = (typeof env?.AD_TAG === "string" ? env.AD_TAG : CONFIG.adTagHex || "").trim();
   const debug = env?.DEBUG === "true" || env?.DEBUG === "1" || CONFIG.debug === true;
+  const decoyUrl = (typeof env?.DECOY_URL === "string" ? env.DECOY_URL : "").trim();
 
   let hostnames = [];
   if (typeof env?.HOSTNAME === "string" && env.HOSTNAME.trim()) {
@@ -636,21 +747,27 @@ function resolveConfig(env) {
     hostnames = CONFIG.hostnames.map((s) => String(s).trim().toLowerCase()).filter(Boolean);
   }
 
+  const maxStreams = env?.MAX_STREAMS && !isNaN(parseInt(env.MAX_STREAMS, 10))
+    ? Math.min(32, Math.max(1, parseInt(env.MAX_STREAMS, 10)))
+    : CONFIG.maxStreams;
+
   return {
     secretHex,
     adTagHex,
     debug,
     hostnames,
+    decoyUrl,
+    maxStreams,
     generatorEnabled: env?.GENERATOR_ENABLED !== undefined ? (env.GENERATOR_ENABLED === "true" || env.GENERATOR_ENABLED === "1") : CONFIG.generatorEnabled,
     generatorKey: (typeof env?.GENERATOR_KEY === "string" ? env.GENERATOR_KEY : CONFIG.generatorKey || "").trim(),
     acceptGenerated: env?.ACCEPT_GENERATED !== undefined ? (env.ACCEPT_GENERATED === "true" || env.ACCEPT_GENERATED === "1") : CONFIG.acceptGenerated,
     dc: CONFIG.dc,
     dcPort: CONFIG.dcPort,
+    dcPorts: CONFIG.dcPorts,
     carrier: CONFIG.carrier,
     batchBytes: CONFIG.batchBytes,
     bootstrapTtl: CONFIG.bootstrapTtl,
     sessionTtl: CONFIG.sessionTtl,
-    maxStreams: CONFIG.maxStreams,
     maxQueued: CONFIG.maxQueued,
     streamWindow: CONFIG.streamWindow,
     dataChunk: CONFIG.dataChunk
@@ -662,7 +779,7 @@ let cachedKey = null;
 
 async function getRuntime(env) {
   const resolved = resolveConfig(env);
-  const cacheKey = `${resolved.secretHex}:${resolved.generatorKey}:${resolved.hostnames.join(",")}:${resolved.adTagHex}:${resolved.debug}`;
+  const cacheKey = `${resolved.secretHex}:${resolved.generatorKey}:${resolved.hostnames.join(",")}:${resolved.adTagHex}:${resolved.decoyUrl}:${resolved.maxStreams}:${resolved.debug}`;
   if (cachedRuntime && cachedKey === cacheKey) {
     return cachedRuntime;
   }
@@ -709,9 +826,11 @@ async function buildRuntime(cfg) {
     hosts,
     dc: cfg.dc,
     dcPort: cfg.dcPort,
+    dcPorts: cfg.dcPorts,
     adTag,
     adTagHex: cfg.adTagHex,
     debug: cfg.debug,
+    decoyUrl: cfg.decoyUrl,
     acceptGenerated: cfg.acceptGenerated,
     generatorEnabled: cfg.generatorEnabled,
     streamWindow: cfg.streamWindow,
@@ -774,16 +893,39 @@ function generatorLabel(url) {
 
 async function serveSecret(cfg, host, label) {
   const clean = String(label || "").replace(/[\u0000-\u001f\u007f]/g, "").trim().slice(0, 128) || host;
-  const secret = await deriveSecret(cfg, clean);
-  if (!secret) return notFound();
-  const hex = bytesToHex(secret);
+
+  let hex = "";
+  let isExisting = false;
+
+  if (cfg && cfg.base) {
+    if (cfg.acceptGenerated && cfg.generatorHmac) {
+      const derived = await deriveSecret(cfg, clean);
+      if (derived) hex = bytesToHex(derived);
+    }
+    if (!hex) {
+      hex = bytesToHex(cfg.base);
+      isExisting = true;
+    }
+  } else {
+    // Fresh deployment without configured SECRET in env: generate strong random secret
+    const randomBytes = crypto.getRandomValues(new Uint8Array(16));
+    hex = bytesToHex(randomBytes);
+  }
+
   const link = "tg://webproxy?server=" + encodeURIComponent(host) + "&secret=" + hex;
   const body = [
-    "server=" + host,
-    "label=" + clean,
-    "secret=" + hex,
-    "link=" + link
+    "=== ProxyGosha Secret Generator ===",
+    isExisting ? "[Status: ACTIVE CONFIGURATION]" : "[Status: NEW SECRET GENERATED]",
+    "",
+    "Server:  " + host,
+    "Secret:  " + hex,
+    "Link:    " + link,
+    "",
+    isExisting
+      ? "Your proxy is running with this secret. Use the link above in Telegram to connect."
+      : "Next Steps to Activate:\n1. Copy the 32-character secret above.\n2. In Cloudflare Dashboard -> Workers & Pages -> your worker -> Settings -> Variables and Secrets.\n3. Add Environment Variable: SECRET with the value above and click Deploy.\n4. Connect in Telegram using the link above!"
   ].join("\n") + "\n";
+
   return new Response(body, {
     status: 200,
     headers: {
@@ -815,12 +957,29 @@ async function verifyToken(cfg, token, kind) {
   return { nonce, mode: nonce[4] === 1 ? 1 : 0 };
 }
 
-function decoy() {
+async function decoy(decoyUrl) {
+  if (decoyUrl && typeof decoyUrl === "string" && (decoyUrl.startsWith("http://") || decoyUrl.startsWith("https://"))) {
+    try {
+      const upstream = await fetch(decoyUrl, {
+        headers: {
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        }
+      });
+      return new Response(upstream.body, {
+        status: upstream.status,
+        headers: {
+          "Content-Type": upstream.headers.get("Content-Type") || "text/html; charset=utf-8",
+          "Cache-Control": "public, max-age=3600"
+        }
+      });
+    } catch (_) {}
+  }
   return new Response(DECOY_HTML, {
     status: 200,
     headers: {
       "Content-Type": "text/html; charset=utf-8",
-      "Cache-Control": "public, max-age=300"
+      "Cache-Control": "public, max-age=3600",
+      "X-Content-Type-Options": "nosniff"
     }
   });
 }
@@ -1012,6 +1171,9 @@ class Stream {
     const address = this.session.cfg.dc[dcKey];
     if (!address) throw new Error("bad dc");
 
+    const candidateIps = Array.isArray(address) ? address : [address];
+    const candidatePorts = Array.isArray(this.session.cfg.dcPorts) ? this.session.cfg.dcPorts : [this.session.cfg.dcPort || 443];
+
     // Middle-End / Ad Tag Routing Check:
     // If AD_TAG is configured, note protocol constraint: native ME handshake requires
     // preserving outbound TCP source port which Cloudflare Workers' NAPT does not support.
@@ -1034,11 +1196,36 @@ class Stream {
     this.dcWritePos = 64;
     this.dcReadPos = 0;
 
-    // Connect directly to the target Telegram Data Center
-    const socket = connect({ hostname: address, port: this.session.cfg.dcPort }, { secureTransport: "off" });
+    // Connect directly to the target Telegram Data Center with multi-IP and port failover
+    let socket = null;
+    let lastError = null;
+
+    for (const hostIp of candidateIps) {
+      for (const port of candidatePorts) {
+        if (this.dead) return;
+        try {
+          const candidateSocket = connect({ hostname: hostIp, port }, { secureTransport: "off" });
+          candidateSocket.closed.catch(() => {});
+          let timer = null;
+          const timeoutPromise = new Promise((_, reject) => {
+            timer = setTimeout(() => reject(new Error("connect timeout")), 3500);
+          });
+          await Promise.race([candidateSocket.opened, timeoutPromise]);
+          clearTimeout(timer);
+          socket = candidateSocket;
+          break;
+        } catch (connErr) {
+          lastError = connErr;
+        }
+      }
+      if (socket) break;
+    }
+
+    if (!socket) {
+      throw lastError || new Error("failed to connect to DC");
+    }
+
     this.socket = socket;
-    socket.closed.catch(() => {});
-    await socket.opened;
     if (this.dead) {
       try { await socket.close(); } catch (_) {}
       return;
@@ -1167,6 +1354,21 @@ class WsSession {
     this.tombstoneOrder = [];
     this.chain = Promise.resolve();
     this.loggedMeNotice = false;
+    this.lastPong = Date.now();
+
+    // Periodic KeepAlive Heartbeat (every 25s)
+    // Prevents Cloudflare 100s idle disconnect and ISP/TSPU DPI idle RST injection
+    this.keepAliveTimer = setInterval(() => {
+      if (this.closed || !this.ws || this.ws.readyState !== 1) {
+        if (this.keepAliveTimer) clearInterval(this.keepAliveTimer);
+        return;
+      }
+      try {
+        const pingPayload = new Uint8Array(4);
+        new DataView(pingPayload.buffer).setUint32(0, Math.floor(Date.now() / 1000), false);
+        this.sendFrame(frame(0x05, 0, pingPayload));
+      } catch (_) {}
+    }, 25000);
   }
 
   sendFrame(bytes) {
@@ -1254,12 +1456,18 @@ class WsSession {
         }
         const stream = this.streams.get(id);
         if (stream) stream.addCredit(new DataView(payload.buffer, payload.byteOffset, 4).getUint32(0, false));
+      } else if (type === 0x05) {
+        // PING frame from client (0x05) -> respond with PONG (0x06) echoing payload
+        if (id === 0) {
+          this.sendFrame(frame(0x06, 0, payload));
+        }
       } else if (type === 0x06) {
-        // PING frame
+        // PONG frame from client (0x06) -> acknowledgment of keepalive
         if (id !== 0) {
           this.shutdown();
           return;
         }
+        this.lastPong = Date.now();
       } else {
         this.shutdown();
         return;
@@ -1270,6 +1478,10 @@ class WsSession {
   dispose() {
     if (this.closed) return;
     this.closed = true;
+    if (this.keepAliveTimer) {
+      clearInterval(this.keepAliveTimer);
+      this.keepAliveTimer = null;
+    }
     for (const stream of Array.from(this.streams.values())) stream.kill(false);
     this.streams.clear();
     this.queued = 0;
@@ -1350,19 +1562,25 @@ export default {
     try {
       const url = new URL(request.url);
       const host = requestHost(request, url);
-      const cfg = await getRuntime(env);
-      if (!cfg) return decoy();
 
+      // Check secret generator BEFORE checking cfg, so fresh deployments without env.SECRET can generate one!
       const label = generatorLabel(url);
       if (label !== null) {
-        if (!cfg.generatorEnabled) return notFound();
+        const generatorEnabled = env?.GENERATOR_ENABLED !== undefined
+          ? (env.GENERATOR_ENABLED === "true" || env.GENERATOR_ENABLED === "1")
+          : CONFIG.generatorEnabled;
+        if (!generatorEnabled) return notFound();
+        const cfg = await getRuntime(env);
         return serveSecret(cfg, host, label || url.searchParams.get("host") || host);
       }
 
-      if (!hostAllowed(cfg, host)) return decoy();
+      const cfg = await getRuntime(env);
+      if (!cfg) return decoy(env?.DECOY_URL);
+
+      if (!hostAllowed(cfg, host)) return decoy(cfg.decoyUrl);
       if (url.pathname === "/" && request.method === "GET") {
         const bridges = url.searchParams.getAll("bridge");
-        if (bridges.length === 0) return decoy();
+        if (bridges.length === 0) return decoy(cfg.decoyUrl);
         const keys = Array.from(url.searchParams.keys());
         if (keys.length !== 1 || keys[0] !== "bridge" || bridges.length !== 1) return notFound();
         const mode = await bridgeMode(cfg, host, bridges[0]);
@@ -1371,9 +1589,9 @@ export default {
       }
       if (url.pathname === "/api/v1/session") return serveSession(request, cfg);
       if (url.pathname === "/api/v1/ws") return serveWebSocket(request, cfg, host);
-      return decoy();
+      return decoy(cfg.decoyUrl);
     } catch (_) {
-      return decoy();
+      return decoy(env?.DECOY_URL);
     }
   }
 };
