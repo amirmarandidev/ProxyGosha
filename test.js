@@ -56,17 +56,20 @@ async function runTestSuite() {
   }
 
   // --- Test 3: Anti-Censorship Decoy Page ---
-  console.log("\n▶ [Test 3] General browser traffic gets rich, anti-probing Decoy page");
+  console.log("\n▶ [Test 3] General browser traffic gets premium fashion store Decoy page");
   {
     const req = new Request(`https://${testHost}/`);
     const res = await worker.fetch(req, { SECRET: testSecret }, {});
     assert.strictEqual(res.status, 200, "Should return HTTP 200");
     assert.strictEqual(res.headers.get("Content-Type"), "text/html; charset=utf-8");
     const html = await res.text();
-    assert.ok(html.includes("EdgeNode Telemetry"), "Should have realistic brand/title");
-    assert.ok(html.includes("All Systems Operational"), "Should include health status");
-    assert.ok(html.length > 1500, `Decoy HTML must be realistic size (actual: ${html.length} bytes)`);
-    console.log(`  ✔ Returned realistic ${html.length}-byte landing page (neutralizes GFW active probing)`);
+    assert.ok(html.includes("LUXVEIL"), "Should have realistic fashion brand name");
+    assert.ok(html.includes("Curated Essentials"), "Should include product section");
+    assert.ok(html.includes("Wool Blend Overcoat"), "Should include product listings");
+    assert.ok(html.includes("newsletter"), "Should include newsletter section");
+    assert.ok(html.includes("footer"), "Should include full footer");
+    assert.ok(html.length > 8000, `Decoy HTML must be realistic size for e-commerce (actual: ${html.length} bytes)`);
+    console.log(`  ✔ Returned realistic ${html.length}-byte fashion store page (neutralizes GFW / DPI active probing)`);
   }
 
   // --- Test 4: Reverse-Proxy Decoy Mode ---
@@ -264,7 +267,31 @@ async function runTestSuite() {
     console.log("  ✔ Verified Cloudflare Free Plan subrequest protection and safe stream rejection logic");
   }
 
-  console.log("\n✨ All 13 test suites PASSED successfully!");
+  // --- Test 14: Resilient Client-Side Heartbeat & 2-Minute Disconnect Prevention ---
+  console.log("\n▶ [Test 14] Client-Side Heartbeat & 2-Minute Disconnect Prevention");
+  {
+    const bridgeToken = await calculateBridge(testSecret, testHost);
+    const req = new Request(`https://${testHost}/?bridge=${bridgeToken}`);
+    const res = await worker.fetch(req, { SECRET: testSecret }, {});
+    assert.strictEqual(res.status, 200);
+    const bridgeHtml = await res.text();
+
+    // 1. Verify active client-side heartbeat to defeat Cloudflare 100s idle timeout
+    assert.ok(bridgeHtml.includes("startHeartbeat"), "Bridge must implement active client heartbeat");
+    assert.ok(bridgeHtml.includes("20000"), "Heartbeat interval must be safely below 100s Cloudflare timeout (20s)");
+
+    // 2. Verify stream 0 control frame absorption (prevents polluting Telegram Desktop internal port)
+    assert.ok(bridgeHtml.includes("id===0"), "Bridge must intercept stream 0 control frames");
+    assert.ok(bridgeHtml.includes("pong[0]=6"), "Bridge must reply to server ping 0x05 with pong 0x06");
+
+    // 3. Verify exponential retry backoff instead of immediate fatal fail()
+    assert.ok(bridgeHtml.includes("reconnectAttempts"), "Bridge must track reconnect attempts with backoff");
+    assert.ok(bridgeHtml.includes("reconnectAttempts>=12"), "Bridge must retry up to 12 attempts before failing");
+
+    console.log("  ✔ Verified client heartbeat, stream 0 frame absorption, and exponential reconnect backoff");
+  }
+
+  console.log("\n✨ All 14 test suites PASSED successfully!");
 }
 
 runTestSuite().catch((err) => {
