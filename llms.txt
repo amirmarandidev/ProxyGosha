@@ -1,0 +1,38 @@
+# ProxyGosha
+
+> Zero-cost, single-file Telegram WEB Proxy running on Cloudflare Workers. Unblock Telegram Desktop with no VPS, no maintenance, and 100% free serverless infrastructure.
+
+## Overview
+ProxyGosha turns a free Cloudflare Worker (`worker.js`) into a personal Telegram Desktop WEB proxy server. It listens on port 443 over HTTPS and WebSockets, serves a deceptive decoy webpage to general HTTP traffic, and tunnels MTProto traffic directly to Telegram data centers (DCs) using raw TCP sockets (`cloudflare:sockets`).
+
+## Key Features
+- **Zero Cost & Serverless**: Runs completely on Cloudflare's free tier (100,000 requests/day).
+- **Single File (`worker.js`)**: Pure JavaScript ES Module without external dependencies or npm build steps.
+- **Stealth Decoy Landing Page**: Browser requests receive an innocent decoy webpage.
+- **One-Click Deployment**: Paste the script into the Cloudflare dashboard, configure environment variables, and connect.
+- **Direct-to-DC Tunneling**: Decodes Obfuscated2 / MTProto framing and establishes low-latency TCP connections to Telegram DCs.
+
+## Technical Specifications
+- **Runtime**: Cloudflare Workers (V8 JavaScript isolate).
+- **Transport**: HTTPS & WSS (WebSocket Secure, Port 443).
+- **Socket Driver**: `cloudflare:sockets` TCP outbound socket.
+- **Protocol**: Telegram Desktop "WEB" proxy carrier (Bridge protocol) + MTProto Obfuscated2.
+- **Client Compatibility**: Telegram Desktop (Windows, macOS, Linux). Not supported on mobile clients (Android/iOS) due to Telegram client-side protocol limits.
+- **Middle-End & Ad Tags**: Sponsored channel ad tags (ME route) are incompatible with Cloudflare Workers due to dynamic NAPT source port translation in Cloudflare's egress network; ProxyGosha uses direct DC routing.
+
+## Environment Variables
+- `SECRET`: 32-character hexadecimal secret for proxy authentication (required).
+- `HOSTNAME`: Optional allowlist of permitted hostname headers.
+- `DEBUG`: Set to `"true"` to enable diagnostic logs (optional).
+
+## Repository Files
+- [worker.js](worker.js): The entire proxy implementation in a single ES Module.
+- [README.md](README.md): English quickstart and user documentation.
+- [README.fa.md](README.fa.md): Persian (فارسی) user documentation and setup guide.
+- [README.ru.md](README.ru.md): Russian (Русский) user documentation and setup guide.
+- [README.zh.md](README.zh.md): Simplified Chinese (简体中文) user documentation and setup guide.
+- [LICENSE](LICENSE): Open-source MIT License.
+
+## Client Link Format
+Telegram Web Proxy link format:
+`tg://webproxy?server=<YOUR_CUSTOM_DOMAIN>&secret=<YOUR_HEX_SECRET>`

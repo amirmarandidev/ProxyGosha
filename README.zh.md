@@ -2,7 +2,21 @@
 
 > **专属于您的 Telegram 电脑端 100% 免费私有代理 —— 无需购买 VPS 服务器、零运维成本、2分钟极速部署。**
 
-[English](README.md) • [فارسی](README.fa.md) • [Русский](README.ru.md) • [简体中文](README.zh.md)
+<p align="center">
+  <a href="https://github.com/amirmarandidev/ProxyGosha/stargazers"><img src="https://img.shields.io/github/stars/amirmarandidev/ProxyGosha?style=for-the-badge&color=gold" alt="GitHub Stars"></a>
+  <a href="https://workers.cloudflare.com/"><img src="https://img.shields.io/badge/Cloudflare-Workers-F38020?style=for-the-badge&logo=cloudflare&logoColor=white" alt="Cloudflare Workers"></a>
+  <a href="https://desktop.telegram.org/"><img src="https://img.shields.io/badge/Telegram-WEB%20Proxy-2CA5E0?style=for-the-badge&logo=telegram&logoColor=white" alt="Telegram WEB Proxy"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue?style=for-the-badge" alt="License MIT"></a>
+  <img src="https://img.shields.io/badge/Cost-%240%20%2F%20Free-brightgreen?style=for-the-badge" alt="Cost Free">
+</p>
+
+<p align="center">
+  <a href="README.md"><b>English</b></a> •
+  <a href="README.fa.md"><b>فارسی</b></a> •
+  <a href="README.ru.md"><b>Русский</b></a> •
+  <a href="README.zh.md"><b>简体中文</b></a> •
+  <a href="llms.txt"><b>llms.txt</b></a>
+</p>
 
 ---
 

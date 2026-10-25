@@ -1,0 +1,84 @@
+# ProxyGosha - Complete Technical Documentation for LLMs
+
+> Single-File Zero-Cost Telegram WEB Proxy for Cloudflare Workers.
+
+## 1. Project Identity & Architecture
+
+ProxyGosha (`worker.js`) is an implementation of Telegram Desktop's official "WEB" proxy server designed to run inside Cloudflare Workers without server infrastructure.
+
+### The Problem It Solves
+Traditional MTProto proxies require:
+- A dedicated Linux Virtual Private Server (VPS) with monthly hosting fees.
+- Exposure to active probing / DPI detection on standard ports.
+- Manual SSL/TLS certificate renewal and daemon management (Docker, systemd).
+
+ProxyGosha eliminates these requirements:
+- Cloudflare Workers provides free serverless execution with 100,000 requests/day.
+- Incoming traffic is disguised as standard HTTPS / WebSocket on port 443 with Cloudflare's trusted TLS certificate.
+- Active probes or browser visits hit a realistic decoy webpage.
+- Outbound connections to Telegram Data Centers (DCs 1-5) use Cloudflare's native `connect()` API from `cloudflare:sockets`.
+
+### High-Level Topology
+```text
+[ Telegram Desktop Client ]
+          │  HTTPS / WSS (Port 443)
+          ▼
+[ Cloudflare Global Anycast Edge ]
+          │
+          ▼
+[ worker.js (ProxyGosha) ]
+  ├── Decoy Engine (returns benign HTML for browser requests)
+  ├── Auth Verification (validates 32-char hex secret)
+  └── Stream Multiplexer
+          │  cloudflare:sockets (Raw TCP)
+          ▼
+[ Telegram Data Centers (DCs 1-5) ]
+```
+
+---
+
+## 2. Protocol Details
+
+### Telegram "WEB" Proxy Carrier
+Telegram Desktop introduced the "WEB" proxy type to bypass restrictive firewalls that block standard MTProto proxies.
+- Handshake endpoint: `/api/v1/bridge` or `/api/v1/ws`
+- Transport: WebSocket streaming bidirectional frames.
+- Framing: Encapsulates Obfuscated2-encoded MTProto packets.
+
+### Obfuscated2 Handshake & Routing
+When a stream opens:
+1. The client sends an initial 64-byte random payload.
+2. The proxy parses bytes 56-59 to determine the target Telegram Data Center (DC 1 to 5, test vs. production).
+3. The proxy extracts AES-CTR encryption and decryption keys derived from the client's handshake bytes and the pre-shared secret.
+4. The proxy connects via TCP to the target Telegram DC IP on port 443 (fallback to port 80 or 5222).
+5. The connection is bi-directionally piped with full backpressure handling.
+
+### Why Middle-End (ME) / Ad Tags are Not Supported on Cloudflare
+Telegram's Middle-End (ME) protocol (which powers sponsored channel / ad tag attribution) requires the proxy server to participate in a cryptographic handshake where AES keys are derived from the server's egress IP and source port. Because Cloudflare Workers run on a shared serverless fleet behind dynamic NAPT (Network Address and Port Translation), the egress source port cannot be determined deterministically in JavaScript before the handshake packets are sent. Hence, pure Cloudflare Workers cannot complete the ME handshake. ProxyGosha cleanly defaults to direct DC routing.
+
+---
+
+## 3. Configuration & Deployment
+
+### Environment Variables
+Set in Cloudflare Dashboard -> Workers & Pages -> Settings -> Variables and Secrets:
+- `SECRET`: (String, Required) 32-character hexadecimal key (e.g. `e89a409cf5fc08ae7b3b2ad4fd2adf6f`).
+- `HOSTNAME`: (String, Optional) Allowed domain name to reject mismatched SNI/Host headers.
+- `DEBUG`: (String, Optional) Set to `"true"` to enable diagnostic console logs.
+
+### Secret Key Generation
+Visiting the worker with `?create-secret` generates a cryptographically secure random 32-hex secret:
+`https://<worker-subdomain>.workers.dev/?create-secret`
+
+### Telegram Connection Link
+`tg://webproxy?server=<YOUR_CUSTOM_DOMAIN>&secret=<YOUR_HEX_SECRET>`
+
+---
+
+## 4. Source Files Reference
+- `worker.js`: Complete implementation containing Decoy HTML, WebSocket upgrade handler, TCP socket connector, and MTProto packet pipe.
+- `README.md`: English documentation and quickstart.
+- `README.fa.md`: Persian (فارسی) documentation.
+- `README.ru.md`: Russian (Русский) documentation.
+- `README.zh.md`: Simplified Chinese (简体中文) documentation.
+- `LICENSE`: MIT License.
