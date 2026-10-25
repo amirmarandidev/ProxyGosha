@@ -1,9 +1,9 @@
 # ProxyGosha
 
-> Zero-cost, single-file Telegram WEB Proxy running on Cloudflare Workers. Unblock Telegram Desktop with no VPS, no maintenance, and 100% free serverless infrastructure.
+> Zero-cost, single-file Telegram WEB Proxy running on Cloudflare Workers. Unblock Telegram (Desktop, Android, and iOS) with no VPS, no maintenance, and 100% free serverless infrastructure.
 
 ## Overview
-ProxyGosha turns a free Cloudflare Worker (`worker.js`) into a personal Telegram Desktop WEB proxy server. It listens on port 443 over HTTPS and WebSockets, serves a deceptive decoy webpage to general HTTP traffic, and tunnels MTProto traffic directly to Telegram data centers (DCs) using raw TCP sockets (`cloudflare:sockets`).
+ProxyGosha turns a free Cloudflare Worker (`worker.js`) into a personal Telegram WEB proxy server. It listens on port 443 over HTTPS and WebSockets, serves a deceptive decoy webpage to general HTTP traffic, and tunnels MTProto traffic directly to Telegram data centers (DCs) using raw TCP sockets (`cloudflare:sockets`).
 
 ## Key Features
 - **Zero Cost & Serverless**: Runs completely on Cloudflare's free tier (100,000 requests/day).
@@ -17,7 +17,7 @@ ProxyGosha turns a free Cloudflare Worker (`worker.js`) into a personal Telegram
 - **Transport**: HTTPS & WSS (WebSocket Secure, Port 443).
 - **Socket Driver**: `cloudflare:sockets` TCP outbound socket.
 - **Protocol**: Telegram Desktop "WEB" proxy carrier (Bridge protocol) + MTProto Obfuscated2.
-- **Client Compatibility**: Telegram Desktop (Windows, macOS, Linux). Not supported on mobile clients (Android/iOS) due to Telegram client-side protocol limits.
+- **Client Compatibility**: All Telegram clients (Desktop, Android, and iOS) wherever the "WEB" proxy option is enabled/supported in the client update.
 - **Middle-End & Ad Tags**: Sponsored channel ad tags (ME route) are incompatible with Cloudflare Workers due to dynamic NAPT source port translation in Cloudflare's egress network; ProxyGosha uses direct DC routing.
 
 ## Environment Variables

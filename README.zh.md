@@ -1,6 +1,6 @@
 # ⚡ 基于 Cloudflare Workers 的免费 Telegram WEB 代理
 
-> **专属于您的 Telegram 电脑端 100% 免费私有代理 —— 无需购买 VPS 服务器、零运维成本、2分钟极速部署。**
+> **专属于您的 Telegram（电脑端、安卓及 iOS）100% 免费私有代理 —— 无需购买 VPS 服务器、零运维成本、2分钟极速部署。**
 
 <p align="center">
   <a href="https://github.com/amirmarandidev/ProxyGosha/stargazers"><img src="https://img.shields.io/github/stars/amirmarandidev/ProxyGosha?style=for-the-badge&color=gold" alt="GitHub Stars"></a>
@@ -22,10 +22,10 @@
 
 ### 🌟 这是什么？（通俗易懂版 / ELI5）
 
-Telegram 桌面客户端（Telegram Desktop）支持一种新型的 **WEB Proxy** 代理协议。与传统需要每月租用昂贵 VPS 服务器并配置复杂 Linux 环境的方式不同，本项目利用免费的 **Cloudflare Workers** 边缘无服务器环境，将其打造成您的专属私有 Telegram 代理。
+Telegram 推出了一种新型且高抗封锁的 **WEB Proxy** 代理协议（适用于所有 Telegram 客户端：电脑端、安卓与 iOS，只要其更新版本支持/启用了 WEB 代理功能）。与传统需要每月租用昂贵 VPS 服务器并配置复杂 Linux 环境的方式不同，本项目利用免费的 **Cloudflare Workers** 边缘无服务器环境，将其打造成您的专属私有 Telegram 代理。
 
 * 🌐 **伪装成普通网站：** 如果审查系统或普通访客在浏览器中打开您的域名，只会看到一个无害的普通网页（显示 "Welcome - This site is online"），隐蔽性极高。
-* 🚀 **极速连接 Telegram：** 当 Telegram 电脑版连接此域名时，流量会通过 Cloudflare 的全球边缘网络安全隧道直达 Telegram 官方数据中心。
+* 🚀 **极速连接 Telegram：** 当 Telegram 客户端连接此域名时，流量会通过 Cloudflare 的全球边缘网络安全隧道直达 Telegram 官方数据中心。
 * 💰 **完全免费（0 元成本）：** 100% 运行在 Cloudflare 免费套餐配额内，无需绑定信用卡，无需购买任何服务器。
 
 ---
@@ -73,8 +73,8 @@ https://tg-proxy.<您的子域名>.workers.dev/?create-secret
 2. 输入已托管在 Cloudflare 上的域名或二级域名（例如 `tg.yourdomain.com`）。
 3. Cloudflare 将自动为其签发免费 SSL 证书并开启标准的 443 端口代理。
 
-#### 第 6 步：在 Telegram 电脑端连接！
-打开 Telegram 电脑客户端：
+#### 第 6 步：在 Telegram 客户端（电脑端、安卓或 iOS）连接！
+在任何支持 WEB Proxy 选项的 Telegram 客户端中（例如 Telegram Desktop）：
 1. 前往 **设置** (Settings) > **高级** (Advanced) > **连接类型** (Connection type) > **使用自定义代理** > **添加代理**。
 2. 代理类型选择 **WEB**。
 3. 填入连接信息：
@@ -93,8 +93,8 @@ https://tg-proxy.<您的子域名>.workers.dev/?create-secret
 ### ❓ 常见问题 (FAQ)
 
 <details>
-<summary><b>手机版 Telegram（安卓 / iPhone）可以使用吗？</b></summary>
-暂时不支持。Telegram 的 "WEB Proxy" 是专门基于网页桥接的新协议，目前仅在 <b>Telegram Desktop 电脑端</b>（Windows、macOS、Linux）受支持。手机移动端目前仅支持 SOCKS5 和标准 MTProto 协议。
+<summary><b>此代理支持所有 Telegram 客户端（电脑端、安卓和 iOS）吗？</b></summary>
+<b>是的，完全支持！</b> 该代理适用于<b>所有 Telegram 官方客户端（电脑端、Android 和 iOS）</b>，前提是您的 Telegram 客户端更新中已启用或支持 <b>WEB</b> 代理类型。Telegram Desktop 桌面端原生已全面支持；移动端（安卓及 iOS）只要在客户端更新中启用了 WEB 代理功能，均可使用同一链接与配置秒速连接。
 </details>
 
 <details>

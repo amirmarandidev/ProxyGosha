@@ -20,7 +20,7 @@ ProxyGosha eliminates these requirements:
 
 ### High-Level Topology
 ```text
-[ Telegram Desktop Client ]
+[ Telegram Client (Desktop / Android / iOS) ]
           │  HTTPS / WSS (Port 443)
           ▼
 [ Cloudflare Global Anycast Edge ]
@@ -40,7 +40,7 @@ ProxyGosha eliminates these requirements:
 ## 2. Protocol Details
 
 ### Telegram "WEB" Proxy Carrier
-Telegram Desktop introduced the "WEB" proxy type to bypass restrictive firewalls that block standard MTProto proxies.
+Telegram introduced the "WEB" proxy type to bypass restrictive firewalls that block standard MTProto proxies. It functions across all Telegram clients (Desktop, Android, and iOS) where the WEB proxy option is enabled.
 - Handshake endpoint: `/api/v1/bridge` or `/api/v1/ws`
 - Transport: WebSocket streaming bidirectional frames.
 - Framing: Encapsulates Obfuscated2-encoded MTProto packets.

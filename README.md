@@ -1,6 +1,6 @@
 # ⚡ Free Telegram WEB Proxy on Cloudflare Workers
 
-> **Your personal, 100% free Telegram Desktop proxy — zero servers, zero maintenance, 2-minute setup.**
+> **Your personal, 100% free Telegram proxy (Desktop, Android & iOS) — zero servers, zero maintenance, 2-minute setup.**
 
 <p align="center">
   <a href="https://github.com/amirmarandidev/ProxyGosha/stargazers"><img src="https://img.shields.io/github/stars/amirmarandidev/ProxyGosha?style=for-the-badge&color=gold" alt="GitHub Stars"></a>
@@ -22,10 +22,10 @@
 
 ### 🌟 What is this? (ELI5)
 
-Telegram Desktop has a modern proxy type called **WEB Proxy**. Instead of renting an expensive server or configuring complex software, this project turns a **free Cloudflare Worker** into your private Telegram proxy.
+Telegram has introduced a modern, resilient proxy protocol called **WEB Proxy** that works across all Telegram clients (Desktop, Android, and iOS whenever the WEB proxy option is enabled in their app update). Instead of renting an expensive server or configuring complex software, this project turns a **free Cloudflare Worker** into your private Telegram proxy.
 
 * 🌐 **Looks like a normal website:** If someone or a censorship bot opens your domain in a web browser, they just see a harmless "Welcome" page.
-* 🚀 **Unblocks Telegram:** When Telegram Desktop connects to it, it securely tunnels your chats through Cloudflare’s fast global network.
+* 🚀 **Unblocks Telegram:** When Telegram connects to it, it securely tunnels your chats through Cloudflare’s fast global network.
 * 💰 **Cost: \$0 / Month:** Runs completely on Cloudflare's generous free tier. No credit card, no VPS, no Linux terminal needed.
 
 ---
@@ -73,8 +73,8 @@ It will display your unique 32-character secret (e.g., `e89a409cf5fc08ae7b3b2ad4
 2. Enter your domain or subdomain (e.g., `tg.yourdomain.com`).
 3. Cloudflare will automatically set up free SSL and route port 443 to your proxy.
 
-#### Step 6: Connect Telegram Desktop!
-In Telegram Desktop:
+#### Step 6: Connect Telegram (Desktop, Android & iOS)
+In any Telegram client that supports the WEB proxy option (e.g., Telegram Desktop):
 1. Go to **Settings** > **Advanced** > **Connection type** > **Use custom proxy** > **Add proxy**.
 2. Select **WEB** proxy.
 3. Fill in:
@@ -93,8 +93,8 @@ In Telegram Desktop:
 ### ❓ Frequently Asked Questions (FAQ)
 
 <details>
-<summary><b>Does it work on Android or iPhone?</b></summary>
-Not yet. The "WEB" proxy type is a special browser-bridge protocol currently supported exclusively by <b>Telegram Desktop</b> (Windows, macOS, Linux). Mobile Telegram apps only support SOCKS5 and MTProto.
+<summary><b>Does it work across all Telegram clients (Desktop, Android, and iOS)?</b></summary>
+<b>Yes!</b> This proxy works on <b>all Telegram clients (Desktop, Android, and iOS)</b> provided that the <b>WEB</b> proxy type is enabled in their Telegram app update. Telegram Desktop already natively supports WEB proxy out of the box, and mobile clients (Android & iOS) connect seamlessly as soon as the WEB proxy feature is enabled in their installed update.
 </details>
 
 <details>
