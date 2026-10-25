@@ -90,6 +90,31 @@ In any Telegram client that supports the WEB proxy option (e.g., Telegram Deskto
 
 ---
 
+### 🛡️ Censorship Resilience Guide (Iran, Russia & China)
+
+If you experience connection drops, packet loss, or ISP throttling during heavy censorship periods:
+
+1. **Alternate Cloudflare HTTPS Ports (if port 443 is throttled):**  
+   Cloudflare supports these additional secure HTTPS/WSS ports:  
+   `8443` • `2053` • `2083` • `2087` • `2096`  
+   In Telegram Desktop, you can change the port to `8443` or `2053`, or use this link format:  
+   `tg://webproxy?server=tg.yourdomain.com&port=8443&secret=YOUR_SECRET`
+
+2. **Clean IP (Bypassing Cloudflare IP blocks in Iran):**  
+   If your ISP blocks Cloudflare's default Anycast IP ranges, map your proxy domain to a Clean Cloudflare IP in your local `hosts` file:
+   * **Windows:** `C:\Windows\System32\drivers\etc\hosts`
+   * **macOS / Linux:** `/etc/hosts`
+   * Append a single line:  
+     `162.159.36.1   tg.yourdomain.com`  
+     *(Your system will connect directly to the Clean IP while preserving the SNI and domain certificate without any configuration mismatch).*
+
+3. **Disable ECH in Cloudflare Dashboard (Mandatory for Russia & Recommended for Iran):**  
+   Russia's RKN actively blocks TLS connections utilizing Cloudflare's Encrypted Client Hello (ECH).  
+   In your Cloudflare dashboard, go to your domain:  
+   **SSL/TLS** > **Edge Certificates** > **Encrypted Client Hello (ECH)** = **Disabled**
+
+---
+
 ### ❓ Frequently Asked Questions (FAQ)
 
 <details>

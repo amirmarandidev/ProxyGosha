@@ -126,6 +126,8 @@ const CONFIG = {
   dcPort: 443,
   dcPorts: [443, 80, 5222],
   carrier: "websocket",
+  sessionPath: "/api/v1/session",
+  wsPath: "/api/v1/ws",
   batchBytes: 2097152,
   bootstrapTtl: 120,
   sessionTtl: 86400,
@@ -264,7 +266,7 @@ const BRIDGE_HTML = `<!doctype html>
 <script nonce="__NONCE__">
 (()=>{
 'use strict';
-const relayBase=__RELAY_BASE__,bootstrap=__BOOTSTRAP__,carrierMode=__CARRIER_MODE__;
+const relayBase=__RELAY_BASE__,bootstrap=__BOOTSTRAP__,carrierMode=__CARRIER_MODE__,sessionPath=__SESSION_PATH__,wsPath=__WS_PATH__;
 const fragment=location.hash,androidNonce=/^#android=([A-Za-z0-9_-]{43})$/.exec(fragment)?.[1]||'';
 history.replaceState(null,'',location.pathname);
 let initialized=false,closed=false,port=null,sessionToken='',createStarted=false;
@@ -377,15 +379,15 @@ function fail(){
 async function createSession(first){
  try{
   status('connecting');
-  const response=await request('api/v1/session',()=>options('POST',bootstrap,first));
+  const response=await request(sessionPath,()=>options('POST',bootstrap,first));
   if(response.status!==200||response.headers.get('X-Carrier-Mode')!==carrierMode)throw new Error('session creation rejected');
   sessionToken=response.headers.get('X-Session-Token')||'';
   downCursor=response.headers.get('X-Down-Cursor')||'0';
   if(!sessionToken)throw new Error('missing session token');
-  if(closed){fetch(relayBase+'api/v1/session',options('DELETE',sessionToken,null,null,undefined,true)).catch(()=>{});return}
+  if(closed){fetch(relayBase+sessionPath,options('DELETE',sessionToken,null,null,undefined,true)).catch(()=>{});return}
   const welcome=await response.arrayBuffer();
   if(carrierMode==='websocket')await openWebSocket();
-  if(closed){fetch(relayBase+'api/v1/session',options('DELETE',sessionToken,null,null,undefined,true)).catch(()=>{});return}
+  if(closed){fetch(relayBase+sessionPath,options('DELETE',sessionToken,null,null,undefined,true)).catch(()=>{});return}
   port.postMessage(welcome,[welcome]);
   status('connected');
   for(const data of pending.splice(0)){release(data.byteLength,1,null);queueCarrier(data)}
@@ -489,7 +491,7 @@ async function pollLane(lane){
 }
 function openWebSocket(){
  return new Promise((resolve,reject)=>{
-  const target=relayBase.replace(/^https:/,'wss:')+'api/v1/ws',socket=new WebSocket(target,'tproxy-v1.'+sessionToken);
+  const target=relayBase.replace(/^https:/,'wss:')+wsPath,socket=new WebSocket(target,'tproxy-v1.'+sessionToken);
   webSocket=socket;socket.binaryType='arraybuffer';
   socket.onopen=()=>resolve();
   socket.onmessage=event=>{
@@ -536,7 +538,7 @@ function finishWebSocketLane(lane,notify){
  if(notify&&port&&!closed){const frame=closeFrame(lane.id);port.postMessage(frame,[frame])}
 }
 function openWebSocketLane(lane){
- const target=relayBase.replace(/^https:/,'wss:')+'api/v1/ws';
+ const target=relayBase.replace(/^https:/,'wss:')+wsPath;
  const socket=new WebSocket(target,'tproxy-lane-v1.'+sessionToken+'.'+lane.id);
  lane.socket=socket;socket.binaryType='arraybuffer';
  socket.onopen=()=>{if(closed||lane.finished){socket.close();return}lane.opened=true;status('connected');runWebSocketLaneUp(lane)};
@@ -589,7 +591,7 @@ function close(notifyServer){
  }
  if(webSocketTimer)clearTimeout(webSocketTimer);
  if(webSocket)webSocket.close();
- if(notifyServer&&sessionToken)fetch(relayBase+'api/v1/session',options('DELETE',sessionToken,null,null,undefined,true)).catch(()=>{});
+ if(notifyServer&&sessionToken)fetch(relayBase+sessionPath,options('DELETE',sessionToken,null,null,undefined,true)).catch(()=>{});
  if(port)port.close();
 }
 function activatePort(nextPort){
@@ -751,6 +753,14 @@ function resolveConfig(env) {
     ? Math.min(32, Math.max(1, parseInt(env.MAX_STREAMS, 10)))
     : CONFIG.maxStreams;
 
+  const sessionPath = (typeof env?.SESSION_PATH === "string" && env.SESSION_PATH.trim())
+    ? (env.SESSION_PATH.trim().startsWith("/") ? env.SESSION_PATH.trim() : "/" + env.SESSION_PATH.trim())
+    : CONFIG.sessionPath;
+
+  const wsPath = (typeof env?.WS_PATH === "string" && env.WS_PATH.trim())
+    ? (env.WS_PATH.trim().startsWith("/") ? env.WS_PATH.trim() : "/" + env.WS_PATH.trim())
+    : CONFIG.wsPath;
+
   return {
     secretHex,
     adTagHex,
@@ -758,6 +768,8 @@ function resolveConfig(env) {
     hostnames,
     decoyUrl,
     maxStreams,
+    sessionPath,
+    wsPath,
     generatorEnabled: env?.GENERATOR_ENABLED !== undefined ? (env.GENERATOR_ENABLED === "true" || env.GENERATOR_ENABLED === "1") : CONFIG.generatorEnabled,
     generatorKey: (typeof env?.GENERATOR_KEY === "string" ? env.GENERATOR_KEY : CONFIG.generatorKey || "").trim(),
     acceptGenerated: env?.ACCEPT_GENERATED !== undefined ? (env.ACCEPT_GENERATED === "true" || env.ACCEPT_GENERATED === "1") : CONFIG.acceptGenerated,
@@ -779,7 +791,7 @@ let cachedKey = null;
 
 async function getRuntime(env) {
   const resolved = resolveConfig(env);
-  const cacheKey = `${resolved.secretHex}:${resolved.generatorKey}:${resolved.hostnames.join(",")}:${resolved.adTagHex}:${resolved.decoyUrl}:${resolved.maxStreams}:${resolved.debug}`;
+  const cacheKey = `${resolved.secretHex}:${resolved.generatorKey}:${resolved.hostnames.join(",")}:${resolved.adTagHex}:${resolved.decoyUrl}:${resolved.maxStreams}:${resolved.sessionPath}:${resolved.wsPath}:${resolved.debug}`;
   if (cachedRuntime && cachedKey === cacheKey) {
     return cachedRuntime;
   }
@@ -831,6 +843,8 @@ async function buildRuntime(cfg) {
     adTagHex: cfg.adTagHex,
     debug: cfg.debug,
     decoyUrl: cfg.decoyUrl,
+    sessionPath: cfg.sessionPath,
+    wsPath: cfg.wsPath,
     acceptGenerated: cfg.acceptGenerated,
     generatorEnabled: cfg.generatorEnabled,
     streamWindow: cfg.streamWindow,
@@ -867,18 +881,27 @@ async function deriveSecret(cfg, label) {
   return mac.subarray(0, 16);
 }
 
-async function bridgeMode(cfg, host, capability) {
+async function bridgeMode(cfg, host, capability, port) {
   const provided = b64uDecodeStrict(capability);
   if (!provided || provided.length !== 32) return -1;
-  const context = te.encode("tdesktop-web-proxy-bridge-v1\n" + host);
-  for (const key of cfg.bridgeKeys) {
-    if (await crypto.subtle.verify("HMAC", key, provided, context)) return 0;
+
+  // Support both canonical hostname and host:port for alternate Cloudflare ports (8443, 2053, etc.)
+  const candidateHosts = [host];
+  if (port && port !== "443" && port !== "80") {
+    candidateHosts.push(`${host}:${port}`);
   }
-  if (cfg.acceptGenerated) {
-    const secret = await deriveSecret(cfg, host);
-    if (secret) {
-      const key = await importHmac(secret, ["verify"]);
-      if (await crypto.subtle.verify("HMAC", key, provided, context)) return 1;
+
+  for (const h of candidateHosts) {
+    const context = te.encode("tdesktop-web-proxy-bridge-v1\n" + h);
+    for (const key of cfg.bridgeKeys) {
+      if (await crypto.subtle.verify("HMAC", key, provided, context)) return 0;
+    }
+    if (cfg.acceptGenerated) {
+      const secret = await deriveSecret(cfg, h);
+      if (secret) {
+        const key = await importHmac(secret, ["verify"]);
+        if (await crypto.subtle.verify("HMAC", key, provided, context)) return 1;
+      }
     }
   }
   return -1;
@@ -891,7 +914,7 @@ function generatorLabel(url) {
   return null;
 }
 
-async function serveSecret(cfg, host, label) {
+async function serveSecret(cfg, host, label, port) {
   const clean = String(label || "").replace(/[\u0000-\u001f\u007f]/g, "").trim().slice(0, 128) || host;
 
   let hex = "";
@@ -912,12 +935,13 @@ async function serveSecret(cfg, host, label) {
     hex = bytesToHex(randomBytes);
   }
 
-  const link = "tg://webproxy?server=" + encodeURIComponent(host) + "&secret=" + hex;
+  const portSuffix = (port && port !== "443" && port !== "80") ? "&port=" + port : "";
+  const link = "tg://webproxy?server=" + encodeURIComponent(host) + portSuffix + "&secret=" + hex;
   const body = [
     "=== ProxyGosha Secret Generator ===",
     isExisting ? "[Status: ACTIVE CONFIGURATION]" : "[Status: NEW SECRET GENERATED]",
     "",
-    "Server:  " + host,
+    "Server:  " + host + (port && port !== "443" && port !== "80" ? ":" + port : ""),
     "Secret:  " + hex,
     "Link:    " + link,
     "",
@@ -957,15 +981,16 @@ async function verifyToken(cfg, token, kind) {
   return { nonce, mode: nonce[4] === 1 ? 1 : 0 };
 }
 
-async function decoy(decoyUrl) {
+async function decoy(decoyUrl, requestMethod = "GET") {
   if (decoyUrl && typeof decoyUrl === "string" && (decoyUrl.startsWith("http://") || decoyUrl.startsWith("https://"))) {
     try {
       const upstream = await fetch(decoyUrl, {
+        method: requestMethod === "HEAD" ? "HEAD" : "GET",
         headers: {
           "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
         }
       });
-      return new Response(upstream.body, {
+      return new Response(requestMethod === "HEAD" ? null : upstream.body, {
         status: upstream.status,
         headers: {
           "Content-Type": upstream.headers.get("Content-Type") || "text/html; charset=utf-8",
@@ -974,14 +999,17 @@ async function decoy(decoyUrl) {
       });
     } catch (_) {}
   }
-  return new Response(DECOY_HTML, {
-    status: 200,
-    headers: {
-      "Content-Type": "text/html; charset=utf-8",
-      "Cache-Control": "public, max-age=3600",
-      "X-Content-Type-Options": "nosniff"
-    }
-  });
+  const headers = {
+    "Content-Type": "text/html; charset=utf-8",
+    "Cache-Control": "public, max-age=3600",
+    "X-Content-Type-Options": "nosniff",
+    "ETag": '"edgenode-telemetry-v1.2"',
+    "Vary": "Accept-Encoding"
+  };
+  if (requestMethod === "HEAD") {
+    return new Response(null, { status: 200, headers });
+  }
+  return new Response(DECOY_HTML, { status: 200, headers });
 }
 
 function notFound() {
@@ -994,21 +1022,24 @@ function notFound() {
   });
 }
 
-async function serveBridge(cfg, host, mode) {
+async function serveBridge(cfg, host, mode, port) {
   const nonce = b64uEncode(crypto.getRandomValues(new Uint8Array(18)));
   const bootstrap = await issueToken(cfg, TOKEN_KIND_BOOTSTRAP, cfg.bootstrapTtl, mode);
-  const relayBase = JSON.stringify("https://" + host + "/");
+  const authority = (port && port !== "443" && port !== "80") ? `${host}:${port}` : host;
+  const relayBase = JSON.stringify("https://" + authority + "/");
   const body = BRIDGE_HTML
     .replaceAll("__NONCE__", nonce)
     .replaceAll("__RELAY_BASE__", relayBase)
     .replaceAll("__BOOTSTRAP__", JSON.stringify(bootstrap))
     .replaceAll("__CARRIER_MODE__", JSON.stringify(cfg.carrier))
-    .replaceAll("__BATCH_LIMIT__", String(cfg.batchBytes));
+    .replaceAll("__BATCH_LIMIT__", String(cfg.batchBytes))
+    .replaceAll("__SESSION_PATH__", JSON.stringify(cfg.sessionPath.replace(/^\//, "")))
+    .replaceAll("__WS_PATH__", JSON.stringify(cfg.wsPath.replace(/^\//, "")));
   const csp = [
     "default-src 'none'",
     "base-uri 'none'",
     "child-src 'none'",
-    "connect-src 'self' wss://" + host,
+    "connect-src 'self' wss://" + authority + " wss://" + host + " https://" + authority,
     "font-src 'none'",
     "form-action 'none'",
     "frame-ancestors http://127.0.0.1:*",
@@ -1335,8 +1366,18 @@ class Stream {
       this.creditResolve = null;
       resolve();
     }
+    // Free stream locks immediately to prevent socket exhaustion and resource leaks in Cloudflare Workers
+    if (this.writer) {
+      try { this.writer.releaseLock(); } catch (_) {}
+      this.writer = null;
+    }
+    if (this.reader) {
+      try { this.reader.cancel().catch(() => {}); this.reader.releaseLock(); } catch (_) {}
+      this.reader = null;
+    }
     if (this.socket) {
       try { this.socket.close().catch(() => {}); } catch (_) {}
+      this.socket = null;
     }
     if (notify && !this.session.closed) this.session.sendFrame(frame(0x03, this.id, EMPTY));
   }
@@ -1484,6 +1525,8 @@ class WsSession {
     }
     for (const stream of Array.from(this.streams.values())) stream.kill(false);
     this.streams.clear();
+    this.tombstones.clear();
+    this.tombstoneOrder.length = 0;
     this.queued = 0;
   }
 
@@ -1562,6 +1605,9 @@ export default {
     try {
       const url = new URL(request.url);
       const host = requestHost(request, url);
+      const rawHost = String(request.headers.get("host") || url.host || "");
+      const portMatch = /:([0-9]+)$/.exec(rawHost);
+      const port = portMatch ? portMatch[1] : (url.port || "");
 
       // Check secret generator BEFORE checking cfg, so fresh deployments without env.SECRET can generate one!
       const label = generatorLabel(url);
@@ -1571,27 +1617,49 @@ export default {
           : CONFIG.generatorEnabled;
         if (!generatorEnabled) return notFound();
         const cfg = await getRuntime(env);
-        return serveSecret(cfg, host, label || url.searchParams.get("host") || host);
+        return serveSecret(cfg, host, label || url.searchParams.get("host") || host, port);
       }
 
       const cfg = await getRuntime(env);
-      if (!cfg) return decoy(env?.DECOY_URL);
+      if (!cfg) return decoy(env?.DECOY_URL, request.method);
 
-      if (!hostAllowed(cfg, host)) return decoy(cfg.decoyUrl);
+      // Active Probing Defense & Authentic Web Assets (GFW / TSPU scanner camouflage)
+      if (url.pathname === "/robots.txt") {
+        return new Response(request.method === "HEAD" ? null : "User-agent: *\nAllow: /\nDisallow: /api/\n", {
+          status: 200,
+          headers: { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "public, max-age=86400" }
+        });
+      }
+      if (url.pathname === "/favicon.ico") {
+        const svgIcon = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#3b82f6" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20"/><path d="M2 12h20"/></svg>`;
+        return new Response(request.method === "HEAD" ? null : svgIcon, {
+          status: 200,
+          headers: { "Content-Type": "image/svg+xml", "Cache-Control": "public, max-age=86400" }
+        });
+      }
+      if (url.pathname === "/health" || url.pathname === "/status") {
+        const json = JSON.stringify({ status: "operational", network: "EdgeNode Anycast", uptime: "99.99%", timestamp: Math.floor(Date.now() / 1000) });
+        return new Response(request.method === "HEAD" ? null : json, {
+          status: 200,
+          headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-cache" }
+        });
+      }
+
+      if (!hostAllowed(cfg, host)) return decoy(cfg.decoyUrl, request.method);
       if (url.pathname === "/" && request.method === "GET") {
         const bridges = url.searchParams.getAll("bridge");
-        if (bridges.length === 0) return decoy(cfg.decoyUrl);
+        if (bridges.length === 0) return decoy(cfg.decoyUrl, request.method);
         const keys = Array.from(url.searchParams.keys());
         if (keys.length !== 1 || keys[0] !== "bridge" || bridges.length !== 1) return notFound();
-        const mode = await bridgeMode(cfg, host, bridges[0]);
+        const mode = await bridgeMode(cfg, host, bridges[0], port);
         if (mode < 0) return notFound();
-        return serveBridge(cfg, host, mode);
+        return serveBridge(cfg, host, mode, port);
       }
-      if (url.pathname === "/api/v1/session") return serveSession(request, cfg);
-      if (url.pathname === "/api/v1/ws") return serveWebSocket(request, cfg, host);
-      return decoy(cfg.decoyUrl);
+      if (url.pathname === cfg.sessionPath || url.pathname === "/api/v1/session") return serveSession(request, cfg);
+      if (url.pathname === cfg.wsPath || url.pathname === "/api/v1/ws") return serveWebSocket(request, cfg, host);
+      return decoy(cfg.decoyUrl, request.method);
     } catch (_) {
-      return decoy(env?.DECOY_URL);
+      return decoy(env?.DECOY_URL, request.method);
     }
   }
 };

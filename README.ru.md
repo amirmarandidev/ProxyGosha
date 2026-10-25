@@ -90,6 +90,29 @@ https://tg-proxy.<ваш-поддомен>.workers.dev/?create-secret
 
 ---
 
+### 🛡️ Настройки для обхода жестких блокировок (Россия, Иран, Китай)
+
+Если во время блокировок вы наблюдаете разрывы соединения или замедление:
+
+1. **Альтернативные HTTPS-порты Cloudflare (если порт 443 блокируется ТСПУ):**  
+   Cloudflare поддерживает дополнительные защищенные порты:  
+   `8443` • `2053` • `2083` • `2087` • `2096`  
+   В Telegram Desktop укажите порт `8443` или `2053`, либо используйте ссылку:  
+   `tg://webproxy?server=tg.yourdomain.com&port=8443&secret=ВАШ_СЕКРЕТ`
+
+2. **Отключение ECH в Cloudflare (Критически важно для России):**  
+   Роскомнадзор (РКН) через ТСПУ полностью блокирует TLS-соединения с технологией Encrypted Client Hello (ECH).  
+   В панели Cloudflare для вашего домена перейдите в:  
+   **SSL/TLS** > **Edge Certificates** > **Encrypted Client Hello (ECH)** = **Disabled (Выключено)**
+
+3. **Чистые IP-адреса Cloudflare (Clean IP):**  
+   При блокировке стандартных подсетей Anycast (104.x, 172.x) пропишите чистый IP Cloudflare в файле `hosts`:  
+   * **Windows:** `C:\Windows\System32\drivers\etc\hosts`  
+   * **macOS / Linux:** `/etc/hosts`  
+   * Добавьте строку: `162.159.36.1   tg.yourdomain.com`
+
+---
+
 ### ❓ Часто задаваемые вопросы (FAQ)
 
 <details>

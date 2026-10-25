@@ -90,6 +90,30 @@ https://tg-proxy.<您的子域名>.workers.dev/?create-secret
 
 ---
 
+### 🛡️ 强封锁环境抗干扰配置指南（中国、伊朗、俄罗斯）
+
+若在封锁加剧期间遇到连接重置、断连或速度受限：
+
+1. **启用 Cloudflare 备用安全端口（当 443 端口受阻时）：**  
+   Cloudflare 支持多个标准的 HTTPS / WSS 端口：  
+   `8443` • `2053` • `2083` • `2087` • `2096`  
+   在 Telegram Desktop 中可直接将端口改为 `8443` 或 `2053`，或使用链接格式：  
+   `tg://webproxy?server=tg.yourdomain.com&port=8443&secret=YOUR_SECRET`
+
+2. **优选 Clean IP 绑定（通过 hosts 文件避免 Anycast 阻断）：**  
+   当电信/联通或当地运营商劣化 Cloudflare 默认 Anycast IP 时，可在系统 `hosts` 文件中将域名指向 Clean IP：  
+   * **Windows：** `C:\Windows\System32\drivers\etc\hosts`  
+   * **macOS / Linux：** `/etc/hosts`  
+   * 添加一行例如：`162.159.36.1   tg.yourdomain.com`  
+   *(此操作仅重定向 IP，依然保留正确的 SNI 与证书校验，不会破坏代理连接)*
+
+3. **在 Cloudflare 控制台中关闭 ECH（对俄罗斯及部分网络至关重要）：**  
+   俄罗斯 RKN 及部分审查系统会阻断带有 ECH (Encrypted Client Hello) 的 TLS 握手。  
+   在 Cloudflare 仪表盘进入您的域名设置：  
+   **SSL/TLS** > **Edge Certificates** > **Encrypted Client Hello (ECH)** = **Disabled (关闭)**
+
+---
+
 ### ❓ 常见问题 (FAQ)
 
 <details>
