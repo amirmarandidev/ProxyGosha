@@ -1013,20 +1013,31 @@ function generatorLabel(url) {
 }
 
 async function serveSecret(cfg, host, label, port) {
-  const clean = String(label || "").replace(/[\u0000-\u001f\u007f]/g, "").trim().slice(0, 128) || host;
+  const cleanLabel = String(label || "").replace(/^https?:\/\//i, "").replace(/\/.*$/, "").replace(/[\u0000-\u001f\u007f]/g, "").trim().toLowerCase().slice(0, 128);
+  const isCustomDomain = cleanLabel.length > 0;
 
   let hex = "";
+  let domainHex = "";
   let isExisting = false;
 
-  if (cfg && cfg.base) {
-    if (cfg.acceptGenerated && cfg.generatorHmac) {
-      const derived = await deriveSecret(cfg, clean);
+  if (isCustomDomain) {
+    // Generate ASCII hex representation of domain
+    for (let i = 0; i < cleanLabel.length; i++) {
+      domainHex += cleanLabel.charCodeAt(i).toString(16).padStart(2, "0");
+    }
+
+    // Deterministically derive a 16-byte (32-hex) secret based on the address
+    if (cfg && cfg.generatorHmac) {
+      const derived = await deriveSecret(cfg, cleanLabel);
       if (derived) hex = bytesToHex(derived);
     }
     if (!hex) {
-      hex = bytesToHex(cfg.base);
-      isExisting = true;
+      const hash = new Uint8Array(await crypto.subtle.digest("SHA-256", te.encode("tgweb-secret-v1\n" + cleanLabel)));
+      hex = bytesToHex(hash.subarray(0, 16));
     }
+  } else if (cfg && cfg.base) {
+    hex = bytesToHex(cfg.base);
+    isExisting = true;
   } else {
     // Fresh deployment without configured SECRET in env: generate strong random secret
     const randomBytes = crypto.getRandomValues(new Uint8Array(16));
@@ -1035,20 +1046,42 @@ async function serveSecret(cfg, host, label, port) {
 
   const portSuffix = (port && port !== "443" && port !== "80") ? "&port=" + port : "";
   const link = "tg://webproxy?server=" + encodeURIComponent(host) + portSuffix + "&secret=" + hex;
-  const body = [
-    "=== ProxyGosha Secret Generator ===",
-    isExisting ? "[Status: ACTIVE CONFIGURATION]" : "[Status: NEW SECRET GENERATED]",
-    "",
-    "Server:  " + host + (port && port !== "443" && port !== "80" ? ":" + port : ""),
-    "Secret:  " + hex,
-    "Link:    " + link,
-    "",
-    isExisting
-      ? "Your proxy is running with this secret. Use the link above in Telegram to connect."
-      : "Next Steps to Activate:\n1. Copy the 32-character secret above.\n2. In Cloudflare Dashboard -> Workers & Pages -> your worker -> Settings -> Variables and Secrets.\n3. Add Environment Variable: SECRET with the value above and click Deploy.\n4. Connect in Telegram using the link above!"
-  ].join("\n") + "\n";
+  const paddedSecret = "dd" + hex;
+  const paddedLink = "tg://webproxy?server=" + encodeURIComponent(host) + portSuffix + "&secret=" + paddedSecret;
 
-  return new Response(body, {
+  const lines = [
+    "=== ProxyGosha Secret Generator ===",
+    isCustomDomain
+      ? `[Mode: DOMAIN-DERIVED SECRET for "${cleanLabel}"]`
+      : (isExisting ? "[Status: ACTIVE CONFIGURATION]" : "[Status: NEW SECRET GENERATED]"),
+    "",
+    "Server:        " + host + (port && port !== "443" && port !== "80" ? ":" + port : ""),
+  ];
+
+  if (isCustomDomain) {
+    lines.push("Target Domain: " + cleanLabel);
+    lines.push("Domain Hex:    " + domainHex);
+  }
+
+  lines.push("Secret:        " + hex);
+  lines.push("Telegram Link: " + link);
+  lines.push("");
+  lines.push("Padded Secret: " + paddedSecret + " (Random padding mode - recommended)");
+  lines.push("Padded Link:   " + paddedLink);
+  lines.push("");
+
+  if (isExisting && !isCustomDomain) {
+    lines.push("Your proxy is running with this secret. Use the link above in Telegram to connect.");
+  } else {
+    lines.push("Next Steps to Activate:");
+    lines.push("1. Copy the 32-character secret (or dd-padded secret) above.");
+    lines.push("2. In Cloudflare Dashboard -> Workers & Pages -> your worker -> Settings -> Variables and Secrets.");
+    lines.push("3. Add/Update Environment Variable: SECRET with the value above and click Deploy.");
+    lines.push("4. Connect in Telegram using the link above!");
+  }
+  lines.push("");
+
+  return new Response(lines.join("\n"), {
     status: 200,
     headers: {
       "Content-Type": "text/plain; charset=utf-8",
@@ -1715,7 +1748,7 @@ export default {
           : CONFIG.generatorEnabled;
         if (!generatorEnabled) return notFound();
         const cfg = await getRuntime(env);
-        return serveSecret(cfg, host, label || url.searchParams.get("host") || host, port);
+        return serveSecret(cfg, host, label || url.searchParams.get("host") || "", port);
       }
 
       const cfg = await getRuntime(env);

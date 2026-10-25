@@ -291,7 +291,23 @@ async function runTestSuite() {
     console.log("  ✔ Verified client heartbeat, stream 0 frame absorption, and exponential reconnect backoff");
   }
 
-  console.log("\n✨ All 14 test suites PASSED successfully!");
+  // --- Test 15: Address-based Secret Derivation (?create-secret=google.com) ---
+  console.log("\n▶ [Test 15] Address-based Secret Derivation (?create-secret=google.com)");
+  {
+    const req = new Request(`https://${testHost}/?create-secret=google.com`);
+    const res = await worker.fetch(req, {}, {});
+    assert.strictEqual(res.status, 200, "Should return HTTP 200");
+    const body = await res.text();
+    assert.ok(body.includes("DOMAIN-DERIVED SECRET"), "Should show domain-derived mode");
+    assert.ok(body.includes("Target Domain: google.com"), "Should list target domain");
+    assert.ok(body.includes("Domain Hex:    676f6f676c652e636f6d"), "Should display domain ASCII hex");
+    assert.ok(body.includes("fdddc9602a9a808bc6c8d62567dd8dd2"), "Should deterministically derive secret for google.com");
+    assert.ok(body.includes("ddfdddc9602a9a808bc6c8d62567dd8dd2"), "Should display dd-padded variant");
+    assert.ok(body.includes("tg://webproxy?server="), "Should contain tg://webproxy link");
+    console.log("  ✔ Verified deterministic secret derivation and hex domain output for google.com");
+  }
+
+  console.log("\n✨ All 15 test suites PASSED successfully!");
 }
 
 runTestSuite().catch((err) => {
