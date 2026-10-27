@@ -117,10 +117,10 @@ const CONFIG = {
 
   dc: {
     1: ["149.154.175.50", "149.154.175.53", "149.154.175.54"],
-    2: ["149.154.167.51", "149.154.167.50", "149.154.167.40", "149.154.167.41"],
+    2: ["149.154.167.51", "95.161.76.100", "149.154.167.50", "149.154.167.41"],
     3: ["149.154.175.100", "149.154.175.101"],
     4: ["149.154.167.91", "149.154.167.92", "149.154.167.90"],
-    5: ["91.108.56.156", "91.108.56.165", "91.108.56.170"],
+    5: ["149.154.171.5", "91.108.56.156", "91.108.56.165", "91.108.56.170"],
     203: ["91.105.192.110"]
   },
   dcPort: 443,
@@ -142,6 +142,8 @@ const TOKEN_DOMAIN = te.encode("tgweb-token-v1\0");
 const TOKEN_KIND_BOOTSTRAP = 1;
 const TOKEN_KIND_SESSION = 2;
 const REQUEST_LIMIT = 16777216;
+const UP_BATCH_BYTES = 262144;
+const DC_CONNECT_TIMEOUT = 3500;
 
 const PERMISSIONS_POLICY = "accelerometer=(), autoplay=(), camera=(), clipboard-read=(), clipboard-write=(), display-capture=(), encrypted-media=(), fullscreen=(), geolocation=(), gyroscope=(), hid=(), idle-detection=(), magnetometer=(), microphone=(), midi=(), payment=(), picture-in-picture=(), publickey-credentials-create=(), publickey-credentials-get=(), screen-wake-lock=(), serial=(), usb=(), web-share=(), xr-spatial-tracking=()";
 
@@ -1235,6 +1237,62 @@ function safeDcHeaderPrefix(bytes) {
   return true;
 }
 
+function closeQuietly(socket) {
+  if (!socket) return;
+  try { socket.close().catch(() => {}); } catch (_) {}
+}
+
+async function tryConnect(hostname, port) {
+  const socket = connect({ hostname, port }, { secureTransport: "off" });
+  socket.closed.catch(() => {});
+  let timer = null;
+  try {
+    await Promise.race([
+      socket.opened,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error("connect timeout")), DC_CONNECT_TIMEOUT);
+      })
+    ]);
+    return socket;
+  } catch (error) {
+    // Release failed/timed-out sockets so they don't count against the Worker's connection limit
+    closeQuietly(socket);
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Race DC IPs two at a time (shuffled to spread load), trying every IP on a port before the next port
+async function connectDc(ips, ports, isDead) {
+  const order = ips.slice();
+  for (let i = order.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [order[i], order[j]] = [order[j], order[i]];
+  }
+  let lastError = null;
+  for (const port of ports) {
+    for (let i = 0; i < order.length; i += 2) {
+      if (isDead()) return null;
+      const attempts = order.slice(i, i + 2).map((ip) => tryConnect(ip, port));
+      try {
+        const winner = await Promise.any(attempts);
+        for (const attempt of attempts) {
+          attempt.then((socket) => { if (socket !== winner) closeQuietly(socket); }, () => {});
+        }
+        if (isDead()) {
+          closeQuietly(winner);
+          return null;
+        }
+        return winner;
+      } catch (error) {
+        lastError = error.errors?.[0] || error;
+      }
+    }
+  }
+  throw lastError || new Error("failed to connect to DC");
+}
+
 class Stream {
   constructor(session, id) {
     this.session = session;
@@ -1306,10 +1364,16 @@ class Stream {
           }
           continue;
         }
-        this.inQueue.shift();
-        this.queuedLocal -= payload.length;
-        this.session.queued -= payload.length;
-        await this.writeToDc(payload);
+        // Coalesce everything queued so far: one decrypt, one encrypt, one write and one WINDOW grant per batch
+        let total = 0;
+        let count = 0;
+        while (count < this.inQueue.length && (count === 0 || total + this.inQueue[count].length <= UP_BATCH_BYTES)) {
+          total += this.inQueue[count++].length;
+        }
+        const parts = this.inQueue.splice(0, count);
+        this.queuedLocal -= total;
+        this.session.queued -= total;
+        await this.writeToDc(count === 1 ? parts[0] : concat(...parts));
       }
     } catch (_) {
       this.kill(true);
@@ -1359,33 +1423,8 @@ class Stream {
     this.dcReadPos = 0;
 
     // Connect directly to the target Telegram Data Center with multi-IP and port failover
-    let socket = null;
-    let lastError = null;
-
-    for (const hostIp of candidateIps) {
-      for (const port of candidatePorts) {
-        if (this.dead) return;
-        try {
-          const candidateSocket = connect({ hostname: hostIp, port }, { secureTransport: "off" });
-          candidateSocket.closed.catch(() => {});
-          let timer = null;
-          const timeoutPromise = new Promise((_, reject) => {
-            timer = setTimeout(() => reject(new Error("connect timeout")), 3500);
-          });
-          await Promise.race([candidateSocket.opened, timeoutPromise]);
-          clearTimeout(timer);
-          socket = candidateSocket;
-          break;
-        } catch (connErr) {
-          lastError = connErr;
-        }
-      }
-      if (socket) break;
-    }
-
-    if (!socket) {
-      throw lastError || new Error("failed to connect to DC");
-    }
+    const socket = await connectDc(candidateIps, candidatePorts, () => this.dead);
+    if (!socket) return;
 
     this.socket = socket;
     if (this.dead) {
