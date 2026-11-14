@@ -1,0 +1,16 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "proxy-gosha-js-baseline",
+  "main": "src/baseline-entry.js",
+  "compatibility_date": "2026-11-13",
+  "workers_dev": true,
+  "upload_source_maps": true,
+  "durable_objects": {
+    "bindings": [
+      { "name": "CONTROL_PLANE", "class_name": "ProxyGoshaControlPlane" }
+    ]
+  },
+  "exports": {
+    "ProxyGoshaControlPlane": { "type": "durable-object", "storage": "sqlite" }
+  }
+}

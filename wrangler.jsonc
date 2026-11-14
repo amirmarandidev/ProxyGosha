@@ -1,0 +1,23 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "proxy-gosha",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-11-13",
+  "workers_dev": true,
+  "triggers": { "crons": ["*/5 * * * *"] },
+  "upload_source_maps": true,
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "CONTROL_PLANE",
+        "class_name": "ProxyGoshaControlPlane"
+      }
+    ]
+  },
+  "exports": {
+    "ProxyGoshaControlPlane": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    }
+  }
+}

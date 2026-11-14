@@ -164,6 +164,19 @@ https://tg.yourdomain.com/YOUR_ADMIN_KEY/status
 - **DC Probe:** Run an on-demand latency & reachability check directly from Cloudflare to all Telegram Data Centers (DC1–DC5).
 - **Privacy-first:** Metrics and event logs are kept strictly in isolate memory and reset automatically; no IP addresses, tokens, or secrets are ever stored.
 
+### Optional custom-client subscriptions
+
+A subscription credential API is available at `/<ADMIN_KEY>/api/subscriptions`. It
+supports creation, listing, expiry, per-subscription concurrent-session and traffic
+limits, and revocation. The credential is returned only once and its SHA-256 digest
+is stored. To enforce it, set `requireSubscription: true` through the authenticated
+`PUT /<ADMIN_KEY>/api/config` endpoint. Compatible clients must send
+`X-Proxy-Gosha-Subscription` on both `/api/v1/session` and `/api/v1/ws`.
+
+This is not supported by stock Telegram WEB-proxy clients unless they can add that
+custom header. Do not enable the requirement for an ordinary Telegram deployment.
+It does not implement Telegram account identity, billing, or automatic renewal.
+
 ---
 
 ## Ports
@@ -187,6 +200,8 @@ Only `ADMIN_KEY` is required. Everything else is optional.
 | `EXTRA_HOSTS` | Other domains attached to this Worker, separated by commas. The panel generates links for them too. |
 | `DECOY_URL` | A real website to show visitors instead of the built-in store page. Using one makes your proxy harder to tell apart from other deployments. |
 | `CARRIER` | Leave it empty. Set it to `websocket` only if the default mode gives you trouble. |
+| `DC1` … `DC5`, `DC203` | Optional per-DC endpoint overrides. Comma/semicolon/space-separated IPv4, IPv6, or DNS hosts. IPv6 can be bracketed. |
+| `DC_PORTS` | Optional TCP port list replacing the default `443,80,5222`. |
 
 > [!WARNING]
 > If `SECRET` is not set, changing `ADMIN_KEY` also changes the secrets, and **every link you have shared stops working.**
@@ -263,3 +278,70 @@ ProxyGosha is free and open source. To support its development, star the reposit
 
 - **USDT (BEP20):** `0xd593ae9D32bEA690EC62460C54BF3951aFFF7803`
 - **USDT (TRC20):** `THaaHzoTwXfUfcrtYTDXRsMmk9qhnXa56M`
+
+---
+
+## Development and deployment
+
+The TypeScript Worker is now the configured Wrangler entry point (`src/index.ts`).
+The original `worker.js` is retained unchanged as the JavaScript baseline and
+rollback implementation.
+
+Requirements: Node.js 22.6 or newer and npm.
+
+```bash
+npm install
+npm run check
+npm run smoke:worker
+npm run test:e2e
+npm run test:tcp-integration
+npm run test:protocol-diff
+npm run test:workerd-tcp
+```
+
+Run locally with:
+
+```bash
+npm run dev:ts
+```
+
+Deploy the TypeScript entry point with Wrangler after completing the staging and
+independent Telegram-client validation described in
+[`docs/migration/DEPLOYMENT-AND-CLIENT-VALIDATION.md`](docs/migration/DEPLOYMENT-AND-CLIENT-VALIDATION.md):
+
+```bash
+npm run deploy
+```
+
+`wrangler.jsonc` contains non-secret Worker settings. Configure credentials such as
+`ADMIN_KEY`, `SECRET`, and other sensitive values with Cloudflare Worker secrets or
+the dashboard; do not commit them to this repository. Never set `E2E_TEST_MODE`,
+`E2E_DC_HOST`, or `E2E_DC_PORT` in a deployed Worker.
+
+Migration notes and the JavaScript baseline are maintained in
+[`docs/migration/`](docs/migration/).
+
+## Retained features and operational enhancements
+
+The TypeScript port retains the original setup/admin experience, bilingual
+English/Persian pages, browser bridge, Telegram proxy links, optional secret
+generator, LUXVEIL decoy storefront, health/static routes, DC reachability probe,
+both WebSocket carrier modes, and the original Direct-DC/Obfuscated2 proxy path.
+The original `worker.js` remains available as the JavaScript baseline;
+`src/baseline-entry.js` provides a rollback entry point that retains the Durable
+Object class export after the first TypeScript deployment.
+
+New operational capabilities include shared DC endpoint health and scheduled
+probes, per-IP session admission and traffic accounting, webhook alerts, configurable
+metrics retention, audited settings import/export, bounded WebSocket input queues,
+configurable TCP stream idle timeouts, and GitHub Actions CI/manual deployment
+workflows. See
+[`docs/migration/NEW-FEATURES.md`](docs/migration/NEW-FEATURES.md) and [`docs/migration/ROADMAP-COMPLETION.md`](docs/migration/ROADMAP-COMPLETION.md) for the complete
+feature inventory, API fields, bounds, and deployment notes.
+
+### Local core benchmarks
+
+Run `npm run bench:core` to benchmark frame encode/decode across several payload
+sizes and adaptive DC ranking across 32 endpoints. These Node.js microbenchmarks are
+intended for relative comparisons between revisions; they are not representative of
+Cloudflare Worker throughput or real DC network latency.

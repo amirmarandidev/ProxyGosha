@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+      - name: Audit dependencies
+        run: npm audit --audit-level=high
+      - name: Unit, integration and differential tests
+        run: npm run test:all
+      - name: Core frame microbenchmark (informational)
+        run: npm run bench:core
+      - name: Wrangler/workerd TCP integration (both carriers)
+        run: npm run test:workerd-tcp:all
+      - name: Wrangler dry-run build
+        run: npm run build
