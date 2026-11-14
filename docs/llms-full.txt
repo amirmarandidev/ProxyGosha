@@ -1,6 +1,6 @@
 # ProxyGosha - Complete Technical Documentation for LLMs
 
-> Single-File Zero-Cost Telegram WEB Proxy for Cloudflare Workers (v1.2.2).
+> Single-File Zero-Cost Telegram WEB Proxy for Cloudflare Workers (v1.2.3).
 
 ## 1. Project Identity & Architecture
 
@@ -26,7 +26,7 @@ ProxyGosha eliminates these requirements:
 [ Cloudflare Global Anycast Edge ]
           │
           ▼
-[ worker.js (ProxyGosha v1.2.2) ]
+[ worker.js (ProxyGosha v1.2.3) ]
   ├── Decoy Camouflage Engine (serves realistic e-commerce HTML)
   ├── Route Dispatcher (Decoy / Setup / Panel / Status / Session / WS)
   ├── Token & Port Secret Engine (HMAC-SHA256, deterministic derivation)
@@ -64,6 +64,11 @@ To bypass network throttling on port 443 in restrictive regions:
 - Each port uses a distinct, deterministically derived secret:
   `portSecret = sha256("proxygosha-port-secret-v1\n" + baseSecret + "\n" + port).slice(0, 16)`
 - This prevents cross-port correlation by DPI middleboxes and allows users to switch ports instantly if one becomes degraded.
+
+### Error Handling (v1.2.3)
+- All routes run inside `handleRequest()` and are returned with `return await`, so rejected promises are caught by the top-level `fetch()` guard instead of escaping as uncaught exceptions (Cloudflare Error 1101).
+- `safeFallback()` serves the decoy page and can never throw; errors are recorded by `reportError()` to `console.error` (Workers Logs) and the admin `/status` event log.
+- Decoy reverse-proxy responses normalize null-body / out-of-range upstream status codes; WebSocket listeners are individually guarded.
 
 ### Why Middle-End (ME) / Ad Tags are Not Supported
 Telegram's Middle-End (ME) protocol (which enables sponsored channel ad tags via `@MTProxybot`) derives session encryption keys using the proxy's outbound TCP egress IP and source port as observed on Telegram's network interface.

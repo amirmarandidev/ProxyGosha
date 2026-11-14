@@ -1,6 +1,6 @@
 # ProxyGosha
 
-> Zero-cost, single-file Telegram WEB Proxy running on Cloudflare Workers (v1.2.2). Unblock Telegram (Desktop, Android, and iOS) across all 6 Cloudflare HTTPS ports with no VPS, no maintenance, and 100% free serverless infrastructure.
+> Zero-cost, single-file Telegram WEB Proxy running on Cloudflare Workers (v1.2.3). Unblock Telegram (Desktop, Android, and iOS) across all 6 Cloudflare HTTPS ports with no VPS, no maintenance, and 100% free serverless infrastructure.
 
 ## Overview
 ProxyGosha transforms a free Cloudflare Worker (`worker.js`) into a high-performance Telegram WEB proxy server. It listens on all six Cloudflare HTTPS ports (443, 2053, 2083, 2087, 2096, 8443) over HTTPS and WebSockets, serves a deceptive e-commerce decoy landing page to unauthenticated web crawlers and active scanners, and tunnels MTProto traffic directly to official Telegram Data Centers (DCs 1–5) using raw TCP sockets (`cloudflare:sockets`).
@@ -13,10 +13,11 @@ ProxyGosha transforms a free Cloudflare Worker (`worker.js`) into a high-perform
 - **Upstream Batching**: Coalesces small upstream MTProto frames before encrypting and writing to DC sockets, slashing WebCrypto CPU execution overhead.
 - **Live Telemetry & DC Probe**: Built-in admin status dashboard (`/<ADMIN_KEY>/status`) with real-time metrics (active sessions, bandwidth, isolate uptime) and on-demand Telegram DC reachability and latency testing (`?probe=1`).
 - **Privacy-Preserving & Stealth**: No user IP addresses, tokens, or secrets are ever logged or persisted. Unauthorized requests hit an authentic multi-page e-commerce decoy storefront (LUXVEIL).
+- **Robust Error Handling (v1.2.3)**: All route handlers are awaited inside a top-level guard; unexpected exceptions return the decoy page (never Cloudflare Error 1101) and are logged to Workers Logs and the status page.
 - **One-Variable Admin Setup**: Setting `ADMIN_KEY` automatically generates and manages the admin panel, bilingual setup guides (English and Persian), and cryptographic port secrets.
 
 ## Technical Specifications
-- **Version**: 1.2.2
+- **Version**: 1.2.3
 - **Runtime**: Cloudflare Workers (V8 JavaScript isolate).
 - **Transport**: HTTPS & WSS (Ports: 443, 2053, 2083, 2087, 2096, 8443).
 - **Carrier Modes**: `websocket-lanes` (default, multi-stream multiplexing) or `websocket` (single stream).

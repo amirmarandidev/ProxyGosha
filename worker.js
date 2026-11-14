@@ -131,7 +131,7 @@ const ME_CONSTANTS = {
 const HTTPS_PORTS = [443, 2053, 2083, 2087, 2096, 8443];
 
 // Release version of this worker build (shown on the admin status page).
-const VERSION = "1.2.2";
+const VERSION = "1.2.3";
 
 const CONFIG = {
   secretHex: "",                // Overridden by env.SECRET (32 hex or dd+32 hex)
@@ -1553,8 +1553,10 @@ async function decoy(decoyUrl, requestMethod = "GET") {
           "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
         }
       });
-      return new Response(requestMethod === "HEAD" ? null : upstream.body, {
-        status: upstream.status,
+      const status = upstream.status >= 200 && upstream.status <= 599 ? upstream.status : 200;
+      const nullBody = requestMethod === "HEAD" || status === 204 || status === 205 || status === 304;
+      return new Response(nullBody ? null : upstream.body, {
+        status,
         headers: {
           "Content-Type": upstream.headers.get("Content-Type") || "text/html; charset=utf-8",
           "Cache-Control": "no-cache"
@@ -2246,10 +2248,19 @@ async function serveWebSocket(request, cfg, host, port) {
   const server = pair[1];
   server.binaryType = "arraybuffer";
   server.accept();
-  const session = new WsSession(server, cfg, secret, laneId);
-  server.addEventListener("message", (event) => session.enqueue(event.data));
-  server.addEventListener("close", () => session.dispose());
-  server.addEventListener("error", () => session.dispose());
+  let session;
+  try {
+    session = new WsSession(server, cfg, secret, laneId);
+  } catch (error) {
+    reportError("ws session", error);
+    try { server.close(1011, "error"); } catch (_) {}
+    return new Response(null, { status: 101, webSocket: client, headers: { "Sec-WebSocket-Protocol": protocol } });
+  }
+  server.addEventListener("message", (event) => {
+    try { session.enqueue(event.data); } catch (error) { reportError("ws message", error); try { session.shutdown("handler error"); } catch (_) {} }
+  });
+  server.addEventListener("close", () => { try { session.dispose(); } catch (error) { reportError("ws close", error); } });
+  server.addEventListener("error", () => { try { session.dispose(); } catch (error) { reportError("ws error", error); } });
   return new Response(null, {
     status: 101,
     webSocket: client,
@@ -2259,9 +2270,34 @@ async function serveWebSocket(request, cfg, host, port) {
   });
 }
 
-export default {
-  async fetch(request, env, ctx) {
-    try {
+// Records an unexpected error without ever throwing itself. Visible in the
+// Cloudflare dashboard (Workers -> Logs) and on the admin /status page.
+function reportError(where, error) {
+  try {
+    const message = error && error.stack ? String(error.stack) : String(error);
+    console.error("[proxygosha] " + where + ": " + message);
+    logEvent("error", where + ": " + (error && error.message ? error.message : message));
+  } catch (_) {}
+}
+
+// Last-resort response. It must never throw, otherwise Cloudflare shows Error 1101.
+async function safeFallback(env, request) {
+  try {
+    const method = request && typeof request.method === "string" ? request.method : "GET";
+    return await decoy(typeof env?.DECOY_URL === "string" ? env.DECOY_URL.trim() : "", method);
+  } catch (error) {
+    reportError("fallback", error);
+  }
+  try {
+    return new Response(DECOY_HTML, { status: 200, headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-cache" } });
+  } catch (_) {
+    return new Response("", { status: 200 });
+  }
+}
+
+// Every route handler is awaited here, so a rejected promise from any of them
+// lands in the fetch() catch below instead of escaping as an uncaught exception.
+async function handleRequest(request, env, ctx) {
       const url = new URL(request.url);
       const host = requestHost(request, url);
       const rawHost = String(request.headers.get("host") || url.host || "");
@@ -2274,28 +2310,28 @@ export default {
       // Every other path or method answers 404 so an unconfigured worker does
       // not advertise what it is to scanners probing random paths.
       if (!cfg) {
-        if (url.pathname === "/") return serveSetup(host, env, lang, request.method);
+        if (url.pathname === "/") return await serveSetup(host, env, lang, request.method);
         return notFound();
       }
       // Configured with SECRET only (older setup, no ADMIN_KEY yet): the site stays
       // camouflaged, but /setup explains how to add ADMIN_KEY. It reveals no secret.
-      if (!cfg.adminKey && url.pathname === "/setup") return serveSetup(host, env, lang, request.method);
+      if (!cfg.adminKey && url.pathname === "/setup") return await serveSetup(host, env, lang, request.method);
 
       // Admin panel: https://host/<ADMIN_KEY>  (or legacy ?create-secret&key=<ADMIN_KEY>)
       // Admin status & logs: https://host/<ADMIN_KEY>/status  (?probe=1 runs a DC check)
       if (request.method === "GET") {
         const route = panelRoute(url, cfg);
-        if (route === "status") return serveStatus(cfg, host, lang, url.searchParams.get("probe") === "1");
-        if (route === "panel") return servePanel(cfg, host, port, lang);
+        if (route === "status") return await serveStatus(cfg, host, lang, url.searchParams.get("probe") === "1");
+        if (route === "panel") return await servePanel(cfg, host, port, lang);
       }
 
       // Legacy per-domain secret generator (ACCEPT_GENERATED); also gated by ADMIN_KEY.
       const label = generatorLabel(url);
       if (label !== null) {
         if (!cfg.generatorEnabled || !cfg.adminKey || !label || !safeEqual(url.searchParams.get("key") || "", cfg.adminKey)) {
-          return decoy(cfg.decoyUrl, request.method);
+          return await decoy(cfg.decoyUrl, request.method);
         }
-        return serveSecret(cfg, host, label, port);
+        return await serveSecret(cfg, host, label, port);
       }
 
       // Active Probing Defense & Authentic Web Assets (GFW / TSPU scanner camouflage)
@@ -2320,21 +2356,28 @@ export default {
         });
       }
 
-      if (!hostAllowed(cfg, host)) return decoy(cfg.decoyUrl, request.method);
+      if (!hostAllowed(cfg, host)) return await decoy(cfg.decoyUrl, request.method);
       if (url.pathname === "/" && request.method === "GET") {
         const bridges = url.searchParams.getAll("bridge");
-        if (bridges.length === 0) return decoy(cfg.decoyUrl, request.method);
+        if (bridges.length === 0) return await decoy(cfg.decoyUrl, request.method);
         const keys = Array.from(url.searchParams.keys());
         if (keys.length !== 1 || keys[0] !== "bridge" || bridges.length !== 1) return notFound();
         const mode = await bridgeMode(cfg, host, bridges[0], port);
         if (mode < 0) return notFound();
-        return serveBridge(cfg, host, mode, port);
+        return await serveBridge(cfg, host, mode, port);
       }
-      if (url.pathname === cfg.sessionPath || url.pathname === "/api/v1/session") return serveSession(request, cfg);
-      if (url.pathname === cfg.wsPath || url.pathname === "/api/v1/ws") return serveWebSocket(request, cfg, host, port);
-      return decoy(cfg.decoyUrl, request.method);
-    } catch (_) {
-      return decoy(env?.DECOY_URL, request.method);
+      if (url.pathname === cfg.sessionPath || url.pathname === "/api/v1/session") return await serveSession(request, cfg);
+      if (url.pathname === cfg.wsPath || url.pathname === "/api/v1/ws") return await serveWebSocket(request, cfg, host, port);
+      return await decoy(cfg.decoyUrl, request.method);
+}
+
+export default {
+  async fetch(request, env, ctx) {
+    try {
+      return await handleRequest(request, env, ctx);
+    } catch (error) {
+      reportError("fetch " + (request && request.method) + " " + (() => { try { return new URL(request.url).pathname; } catch (_) { return "?"; } })(), error);
+      return safeFallback(env, request);
     }
   }
 };

@@ -42,6 +42,17 @@
 
 ---
 
+## 🩹 What's New in v1.2.3
+
+A stability release focused on **Cloudflare Error 1101** ("Worker threw exception"), which some users saw right after deploying.
+
+- 🛡️ **Error 1101 fixed:** Every route is now fully covered by error handling. If anything unexpected goes wrong, visitors see the normal decoy store page instead of a Cloudflare error screen.
+- 🧾 **Readable error logs:** Unexpected errors are recorded in Cloudflare (**Workers → your Worker → Logs**) and on the `/<ADMIN_KEY>/status` page, so problems can be diagnosed quickly.
+- 🔧 **Safer `DECOY_URL`:** A decoy site that answers with unusual status codes (such as 204 or 304) no longer crashes the Worker.
+- ✅ **No action needed:** Your secrets and links stay exactly the same. Just paste the new `worker.js` and click **Deploy**.
+
+---
+
 ## 🚀 What's New in v1.2.2
 
 This release brings major connection reliability improvements, protocol optimizations, and built-in diagnostics:
