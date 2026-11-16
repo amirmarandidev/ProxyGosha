@@ -11,6 +11,7 @@
 
 <p align="center">
   <a href="README.md"><b>English</b></a> •
+  <a href="docs/README.ar.md"><b>العربية</b></a> •
   <a href="docs/README.fa.md"><b>فارسی</b></a> •
   <a href="docs/README.ru.md"><b>Русский</b></a> •
   <a href="docs/README.zh.md"><b>简体中文</b></a> •
