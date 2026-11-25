@@ -6,16 +6,33 @@ import { connect } from "cloudflare:sockets";
  * 2. Worker -> Settings -> Variables and Secrets -> add ONE variable:
  *        ADMIN_KEY = a long random password (16+ letters/digits)
  *    (Opening the worker address before this shows a setup page with a ready key.)
- * 3. Open  https://<your-domain>/<ADMIN_KEY>  -> panel with ready Telegram links
- *    for every Cloudflare HTTPS port (443, 2053, 2083, 2087, 2096, 8443).
- *    Open  https://<your-domain>/<ADMIN_KEY>/status  -> live status, recent events
- *    and an on-demand Telegram DC reachability probe (add ?probe=1).
- * Optional:
- *    EXTRA_HOSTS = other hostnames attached to this worker, comma separated.
- *                  The panel shows links for them too.
- * Any of the 6 ports can also be typed manually in Telegram (server + port +
- * secret); the Worker accepts all of them without extra settings.
- *    SECRET      = fixed 32-hex secret (otherwise derived from ADMIN_KEY).
+ * 3. Attach a Custom Domain (Workers -> Settings -> Domains & Routes -> Custom Domain),
+ *    because workers.dev is commonly filtered in Iran and only serves port 443.
+ * 4. Open  https://<your-domain>/<ADMIN_KEY>  -> panel with ready Telegram links.
+ *    Official Telegram WEB Proxy uses HTTPS port 443; non-443 Cloudflare HTTPS ports
+ *    (2053, 2083, 2087, 2096, 8443) are kept in the panel for backward compatibility.
+ *    Open  https://<your-domain>/<ADMIN_KEY>/status  -> 5-stage diagnostics, recent
+ *    sanitized events, and an on-demand Cloudflare->Telegram DC probe (?probe=1).
+ * Optional environment variables:
+ *    SECRET           = fixed 32-hex (or dd+32-hex) secret (otherwise derived from ADMIN_KEY)
+ *    EXTRA_HOSTS      = other hostnames already attached to this Worker, comma separated
+ *    CARRIER          = "websocket-lanes" (default, with safe auto-fallback to "websocket"),
+ *                       "websocket" (single multiplexed WS), or "https" (ONLY when optional
+ *                       PROXY_DO SQLite Durable Object binding is attached; otherwise falls
+ *                       back to "websocket-lanes" with an explicit warning in the panel)
+ *    WS_AUTO_FALLBACK = "false" to disable websocket-lanes -> websocket fallback
+ *    SESSION_PATH     = custom path for session bootstrap (default /api/v1/session)
+ *    WS_PATH          = custom path for WebSocket carrier (default /api/v1/ws)
+ *    UP_PATH          = custom path for optional DO HTTPS uplink (default /api/v1/up)
+ *    DOWN_PATH        = custom path for optional DO HTTPS downlink (default /api/v1/down)
+ *    DECOY_URL        = real HTTPS URL you own (or have permission for) to proxy as decoy
+ * Optional Cloudflare bindings (100% Free tier, NOT required for normal operation):
+ *    SETTINGS_KV      = Free Workers KV namespace to save Global Panel Settings live
+ *                       from /<ADMIN_KEY> across all Cloudflare isolates (zero redeploy).
+ *                       Even without SETTINGS_KV, the panel provides instant Per-Operator
+ *                       profile links (Fast / Mobile-Mux / Mobile-Lanes) that work globally!
+ *    PROXY_DO         = Free SQLite Durable Object (ProxySessionDO) to unlock true
+ *                       CARRIER=https long-polling for networks that block WebSocket.
  * =========================================================================
  */
 
@@ -131,11 +148,11 @@ const ME_CONSTANTS = {
 const HTTPS_PORTS = [443, 2053, 2083, 2087, 2096, 8443];
 
 // Release version of this worker build (shown on the admin status page).
-const VERSION = "1.2.3";
+const VERSION = "1.5.1";
 
 const CONFIG = {
   secretHex: "",                // Overridden by env.SECRET (32 hex or dd+32 hex)
-  adTagHex: "",                 // Overridden by env.AD_TAG (32 hex)
+  adTagHex: "",                 // Overridden by env.AD_TAG (32 hex) — ignored in Direct-DC mode
   hostnames: ["*"],             // Overridden by env.HOSTNAME (comma-separated or '*')
   debug: false,                 // Overridden by env.DEBUG ("true" or "1")
 
@@ -153,16 +170,38 @@ const CONFIG = {
   },
   dcPort: 443,
   dcPorts: [443, 80, 5222],
-  carrier: "websocket-lanes",   // "websocket-lanes" (one WS per stream) or "websocket" (all streams in one WS)
+  dcConnectTimeoutMs: 2200,     // Per-attempt TCP connect timeout (bounds client stall)
+  dcTotalTimeoutMs: 7500,       // Total DC connect budget across attempts
+  dcMaxAttempts: 4,             // Max DC connect attempts per stream (stays well under 50 subreq limit)
+  dcMaxConcurrentDials: 4,      // Max simultaneous in-flight DC connects per session (< CF limit of 6)
+  dcWriteTimeoutMs: 25000,      // Max wait for a single DC socket write before aborting stream
+  carrier: "websocket-lanes",   // "websocket-lanes" (default), "websocket", or "https" (requires optional PROXY_DO)
+  wsAutoFallback: true,         // Safe auto-fallback from websocket-lanes -> websocket on lane open failure
   sessionPath: "/api/v1/session",
   wsPath: "/api/v1/ws",
+  upPath: "/api/v1/up",
+  downPath: "/api/v1/down",
   batchBytes: 2097152,
+  wsBatchBytes: 65536,          // Bounded mux WS send chunk (avoids upload bufferbloat on throttled mobile links)
+  wsBufferHighWater: 262144,    // 256 KiB mux WS send high-water mark (keeps PING/chat responsive behind uploads)
+  laneBatchBytes: 131072,       // Bounded per-lane WS send chunk
+  laneBufferHighWater: 524288,  // 512 KiB per-lane WS send high-water mark
+  httpsUpBatch: 131072,         // Starting HTTPS uplink POST batch (adapts down to 32 KiB on slow/lossy upload)
+  httpsDownBatch: 524288,       // Max HTTPS downlink poll response (bounds replay cost on mobile drops)
+  wsInitRetries: 3,             // Initial WebSocket open retries in CARRIER=websocket mode
+  laneOpenTimeoutMs: 7500,      // First-attempt open timeout per WebSocket lane before retry/fallback
+  idleTimeoutMs: 65000,         // Client-side WS heartbeat idle cutoff (ms)
+  speedProfile: "balanced",     // "fast" | "balanced" | "low-upload"
+  dcProfile: "normal",          // "normal" | "tolerant"
   bootstrapTtl: 3600,           // 1 hour (resilient against session renegotiation and client reconnects)
   sessionTtl: 86400,
   maxStreams: 6,                // Safe default for Cloudflare Workers Free plan socket limits
   maxQueued: 16777216,
   streamWindow: 4194304,
-  dataChunk: 65536
+  dataChunk: 65536,
+  httpsPollTimeoutMs: 25000,    // Long-poll hold duration in optional PROXY_DO HTTPS mode
+  httpsIdleTimeoutMs: 90000,    // Idle cleanup timeout for optional PROXY_DO HTTPS sessions
+  httpsDownDataCap: 4194304     // Max buffered downlink DATA per DO session (leaves control headroom)
 };
 
 const te = new TextEncoder();
@@ -170,32 +209,209 @@ const TOKEN_DOMAIN = te.encode("tgweb-token-v1\0");
 const BUILD_SEAL = "Pt54F2/pkjqM1YnQmZRs3Xvqd54U1iZVSYCfYAOgf5wIRzjyeruT";
 const TOKEN_KIND_BOOTSTRAP = 1;
 const TOKEN_KIND_SESSION = 2;
+const TOKEN_KIND_CSRF = 3;
 const PORT_MODE_BASE = 10;
+const PROFILE_MODE_BASE = 20;
 const REQUEST_LIMIT = 16777216;
+const WS_SUBREQ_SOFT_LIMIT = 46; // Safety ceiling below Free plan's 50 external subrequests/invocation
+const KV_SETTINGS_KEY = "panel_settings_v1";
+const KV_SETTINGS_TTL_MS = 15000;
+
+const SPEED_PRESETS = {
+  fast: {
+    wsBatchBytes: 524288,
+    wsBufferHighWater: 1048576,
+    laneBatchBytes: 1048576,
+    laneBufferHighWater: 2097152,
+    httpsUpBatch: 524288,
+    httpsDownBatch: 2097152,
+    wsInitRetries: 2,
+    laneOpenTimeoutMs: 8000,
+    idleTimeoutMs: 60000
+  },
+  balanced: {
+    wsBatchBytes: 65536,
+    wsBufferHighWater: 262144,
+    laneBatchBytes: 131072,
+    laneBufferHighWater: 524288,
+    httpsUpBatch: 131072,
+    httpsDownBatch: 524288,
+    wsInitRetries: 3,
+    laneOpenTimeoutMs: 7500,
+    idleTimeoutMs: 65000
+  },
+  "low-upload": {
+    wsBatchBytes: 32768,
+    wsBufferHighWater: 131072,
+    laneBatchBytes: 65536,
+    laneBufferHighWater: 262144,
+    httpsUpBatch: 65536,
+    httpsDownBatch: 524288,
+    wsInitRetries: 4,
+    laneOpenTimeoutMs: 5500,
+    idleTimeoutMs: 75000
+  }
+};
+
+const DC_PRESETS = {
+  normal: { dcConnectTimeoutMs: 2200, dcTotalTimeoutMs: 7500, dcWriteTimeoutMs: 25000 },
+  tolerant: { dcConnectTimeoutMs: 3000, dcTotalTimeoutMs: 9500, dcWriteTimeoutMs: 30000 }
+};
+
+// Deterministic per-operator profiles (modes 20..23). Each gets a stable secret
+// derived from cfg.base, so multiple users on different ISPs (e.g. FTTH vs Irancell)
+// can connect simultaneously with different transport settings — zero KV/DO needed!
+const OPERATOR_PROFILES = [
+  {
+    id: "fast",
+    mode: PROFILE_MODE_BASE + 0,
+    carrier: "websocket-lanes",
+    wsAutoFallback: true,
+    speedProfile: "fast",
+    dcProfile: "normal",
+    requiresDo: false,
+    titleEn: "High-Speed / Unrestricted ISP & Fixed Broadband",
+    titleFa: "پرسرعت / اینترنت ثابت و اپراتور بدون محدودیت",
+    descEn: "websocket-lanes with large 1 MiB batches for maximum throughput on clean ISPs (FTTH / ADSL / unrestricted mobile).",
+    descFa: "حالت websocket-lanes با بسته‌های بزرگ ۱ مگابایتی برای حداکثر سرعت روی اینترنت ثابت یا اپراتورهای بدون محدودیت."
+  },
+  {
+    id: "mobile-mux",
+    mode: PROFILE_MODE_BASE + 1,
+    carrier: "websocket",
+    wsAutoFallback: false,
+    speedProfile: "low-upload",
+    dcProfile: "tolerant",
+    requiresDo: false,
+    titleEn: "Mobile / Irancell — Single WebSocket & Low-Upload",
+    titleFa: "موبایل / ایرانسل — تک‌کاناله ضد اختلال WS و آپلود محدود",
+    descEn: "Single multiplexed WebSocket with 32 KiB anti-bufferbloat chunks, 4 initial WS retries, and 75s watchdog — best when an ISP drops parallel WS lanes or throttles upload.",
+    descFa: "تک وب‌سوکت مالتی‌پلکس با بسته‌های کوچک ۳۲ کیلوبایتی، ۴ تلاش اولیه و مهلت ۷۵ ثانیه‌ای — مناسب وقتی اپراتور (مثل ایرانسل) WS چندکاناله یا آپلود را محدود می‌کند."
+  },
+  {
+    id: "mobile-lanes",
+    mode: PROFILE_MODE_BASE + 2,
+    carrier: "websocket-lanes",
+    wsAutoFallback: true,
+    speedProfile: "low-upload",
+    dcProfile: "tolerant",
+    requiresDo: false,
+    titleEn: "Mobile — Multi-Lane Low-Upload + Fast Fallback",
+    titleFa: "موبایل — چندکاناله با آپلود آهسته و فالبک سریع",
+    descEn: "websocket-lanes with 64 KiB upload chunks and faster 5.5s open timeout that safely falls back to single WebSocket if lanes are blocked.",
+    descFa: "حالت چندکاناله با بسته‌های ۶۴ کیلوبایتی و تایم‌اوت سریع ۵.۵ ثانیه‌ای که در صورت اختلال، ایمن به تک وب‌سوکت سوئیچ می‌کند."
+  },
+  {
+    id: "https-do",
+    mode: PROFILE_MODE_BASE + 3,
+    carrier: "https",
+    wsAutoFallback: false,
+    speedProfile: "balanced",
+    dcProfile: "tolerant",
+    requiresDo: true,
+    titleEn: "WebSocket-Blocked ISP — True HTTPS Long-Polling",
+    titleFa: "ضد مسدودسازی WebSocket — حالت HTTPS واقعی",
+    descEn: "Serialized HTTPS long-polling via optional PROXY_DO Durable Object (adaptive 128→32 KiB uplink). Only active when PROXY_DO is bound.",
+    descFa: "حالت HTTPS long-polling واقعی از طریق بایندینگ اختیاری PROXY_DO (آپلود تطبیقی ۱۲۸ تا ۳۲ کیلوبایت). فقط در صورت اتصال PROXY_DO فعال است."
+  }
+];
 
 // ---- Lightweight in-memory telemetry (per isolate, best effort) ----
-// No external calls, no dependencies, bounded memory. It powers the admin
-// status page so the operator can answer "is the proxy actually working?".
-// Counters reset whenever Cloudflare recycles the isolate. No client IPs,
-// tokens or secrets are ever recorded.
+// No external calls, no dependencies, bounded memory. Powers the admin status
+// page with stage-by-stage diagnostics (Edge -> Bridge -> Session -> Carrier -> DC).
+// Counters and logs reset whenever Cloudflare recycles this isolate and are NOT
+// shared across isolates or edge regions. No client IPs, ADMIN_KEY, secrets,
+// tokens, or bridge URLs are ever recorded.
 const ISOLATE_START = Date.now();
 const STATS = {
-  sessions: 0,        // WebSocket proxy sessions created in this isolate
-  sessionsActive: 0,  // currently open in this isolate
-  streams: 0,         // MTProto streams opened in this isolate
-  dcAttempts: 0,      // outbound TCP connects to Telegram DCs
-  dcFails: 0,         // failed DC connects
-  bytesUp: 0,         // client -> Telegram bytes (approximate)
-  bytesDown: 0,       // Telegram -> client bytes (approximate)
-  wsRejects: 0,       // WebSocket handshakes rejected (bad/expired token)
+  pageHits: 0,              // Stage 1: root/decoy page hits reaching this isolate
+  bridgeOk: 0,              // Stage 2: valid GET /?bridge= handshakes served
+  bridgeRejects: 0,         // Stage 2: rejected bridge capability / host mismatch
+  sessionCreateOk: 0,       // Stage 3: POST /api/v1/session succeeded
+  sessionCreateRejects: 0,  // Stage 3: POST /api/v1/session rejected
+  sessions: 0,              // Stage 4: WebSocket proxy sessions created in this isolate
+  sessionsActive: 0,        // Stage 4: currently open WebSocket sessions in this isolate
+  wsLanesOpened: 0,         // Stage 4: websocket-lanes upgrades accepted
+  wsMuxOpened: 0,           // Stage 4: multiplexed websocket upgrades accepted
+  wsRejects: 0,             // Stage 4: WebSocket upgrades rejected (bad/expired token/protocol)
+  httpsSessions: 0,         // Stage 4 (optional DO): HTTPS sessions initialized
+  httpsUpOk: 0,             // Stage 4 (optional DO): HTTPS /up requests accepted
+  httpsUpRejects: 0,        // Stage 4 (optional DO): HTTPS /up requests rejected/503
+  httpsDownOk: 0,           // Stage 4 (optional DO): HTTPS /down polls completed
+  httpsDownRejects: 0,      // Stage 4 (optional DO): HTTPS /down polls rejected
+  streams: 0,               // Stage 5: MTProto streams opened in this isolate
+  streamsHeaderOk: 0,       // Stage 5: valid Obfuscated2 client headers decrypted
+  streamsHeaderFail: 0,     // Stage 5: invalid/unrecognized Obfuscated2 headers (e.g. bad secret)
+  dcAttempts: 0,            // Stage 5: outbound TCP connect attempts to Telegram DCs
+  dcOk: 0,                  // Stage 5: successful outbound DC connects
+  dcOk443: 0,               // Stage 5: successful DC connects on port 443
+  dcOk80: 0,                // Stage 5: successful DC connects on port 80
+  dcOk5222: 0,              // Stage 5: successful DC connects on port 5222
+  dcFails: 0,               // Stage 5: failed DC connects (timeout + error)
+  dcTimeouts: 0,            // Stage 5: DC connect timeouts
+  dcErrors: 0,              // Stage 5: DC connect errors (refused/reset/etc)
+  bytesUp: 0,               // client -> Telegram bytes (approximate)
+  bytesDown: 0,             // Telegram -> client bytes (approximate)
   panelViews: 0,
   statusViews: 0
 };
 const LOG = [];
 const LOG_LIMIT = 120;
-function logEvent(event, detail) {
+const DC_COOLDOWN = new Map();
+const DC_COOLDOWN_TTL_MS = 30000;
+const DC_COOLDOWN_LIMIT = 64;
+let carrierFallbackLogged = "";
+
+function markDcCooldown(ip, port, now = Date.now()) {
+  const key = ip + ":" + port;
+  DC_COOLDOWN.set(key, now);
+  if (DC_COOLDOWN.size > DC_COOLDOWN_LIMIT) {
+    const oldest = DC_COOLDOWN.keys().next().value;
+    if (oldest) DC_COOLDOWN.delete(oldest);
+  }
+}
+
+function clearDcCooldown(ip, port) {
+  DC_COOLDOWN.delete(ip + ":" + port);
+}
+
+function isDcCooledDown(ip, port, now = Date.now()) {
+  const key = ip + ":" + port;
+  const ts = DC_COOLDOWN.get(key);
+  if (ts === undefined) return false;
+  if (now - ts >= DC_COOLDOWN_TTL_MS) {
+    DC_COOLDOWN.delete(key);
+    return false;
+  }
+  return true;
+}
+
+// Strips secrets, tokens, query parameters, fragments, and admin paths before logging.
+function sanitizeDetail(detail, secrets) {
+  let text = String(detail || "").replace(/[\r\n\t\u0000-\u001f\u007f]+/g, " ").trim();
+  if (Array.isArray(secrets)) {
+    for (const s of secrets) {
+      if (s && s.length >= 8 && text.includes(s)) text = text.split(s).join("[redacted]");
+    }
+  }
+  text = text
+    .replace(/Bearer\s+[A-Za-z0-9._~+/-]+=*/gi, "Bearer [redacted]")
+    .replace(/tproxy-(?:lane-)?v1\.[A-Za-z0-9._-]+/gi, "tproxy-[redacted]")
+    .replace(/([?&](?:bridge|key|secret|token|admin)=)[^&\s#]+/gi, "$1[redacted]")
+    .replace(/\?[^\s#]+/g, "?[redacted]")
+    .replace(/#[^\s]+/g, "#[redacted]")
+    .replace(/\b(?:dd)?[0-9a-f]{32,}\b/gi, "[hex-redacted]")
+    .replace(/\b[A-Za-z0-9_-]{36,}\b/g, "[tok-redacted]");
+  return text.slice(0, 120);
+}
+
+function logEvent(event, detail, secrets) {
   try {
-    LOG.push({ t: Date.now(), event: String(event).slice(0, 24), detail: String(detail || "").slice(0, 120) });
+    LOG.push({
+      t: Date.now(),
+      event: String(event).replace(/[\r\n\t]+/g, " ").slice(0, 24),
+      detail: sanitizeDetail(detail, secrets)
+    });
     if (LOG.length > LOG_LIMIT) LOG.splice(0, LOG.length - LOG_LIMIT);
   } catch (_) {}
 }
@@ -351,12 +567,12 @@ footer{background:var(--surface);border-top:1px solid var(--border);padding:4rem
 </style>
 </head>
 <body>
-<div class="announce"><div class="announce-inner"><span>Free express shipping on orders over \\$150</span><span>&bull;</span><span>New Season &mdash; Autumn/Winter 2026 Collection now live</span><span>&bull;</span><span>Complimentary gift wrapping on all orders</span><span>&bull;</span><span>Free express shipping on orders over \\$150</span><span>&bull;</span><span>New Season &mdash; Autumn/Winter 2026 Collection now live</span><span>&bull;</span><span>Complimentary gift wrapping on all orders</span></div></div>
+<div class="announce"><div class="announce-inner"><span>Free express shipping on orders over $150</span><span>&bull;</span><span>New Season &mdash; Autumn/Winter 2026 Collection now live</span><span>&bull;</span><span>Complimentary gift wrapping on all orders</span><span>&bull;</span><span>Free express shipping on orders over $150</span><span>&bull;</span><span>New Season &mdash; Autumn/Winter 2026 Collection now live</span><span>&bull;</span><span>Complimentary gift wrapping on all orders</span></div></div>
 <nav><div class="nav-inner"><a href="/" class="nav-logo">LUXVEIL</a><ul class="nav-links"><li><a href="/">New Arrivals</a></li><li><a href="/">Women</a></li><li><a href="/">Men</a></li><li><a href="/">Outerwear</a></li><li><a href="/">Accessories</a></li><li><a href="/">Sale</a></li></ul><div class="nav-icons"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.35-4.35"/></svg><svg viewBox="0 0 24 24"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg><div class="cart-badge"><svg viewBox="0 0 24 24"><path d="M6 2L3 6v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6l-3-4z"/><line x1="3" y1="6" x2="21" y2="6"/><path d="M16 10a4 4 0 0 1-8 0"/></svg></div><div class="hamburger"><span></span><span></span><span></span></div></div></div></nav>
 <section class="hero"><div class="hero-text"><div class="hero-tag">Autumn/Winter 2026</div><h1>Redefine Your<br><em>Everyday</em> Elegance</h1><p>Discover our latest collection of meticulously crafted garments, designed with premium fabrics and contemporary silhouettes for the modern wardrobe.</p><div class="hero-btns"><a href="/" class="btn btn-primary">Shop Collection <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M12 5l7 7-7 7"/></svg></a><a href="/" class="btn btn-outline">Lookbook</a></div></div><div class="hero-visual"><div class="hero-img"></div><div class="hero-float"><div class="hf-label">Best Seller</div><div class="hf-value">Cashmere Overcoat</div></div></div></section>
 <div class="banner"><div class="banner-track"><span>Premium Quality</span><span>&#10022;</span><span>Sustainable Materials</span><span>&#10022;</span><span>Handcrafted Details</span><span>&#10022;</span><span>Worldwide Delivery</span><span>&#10022;</span><span>30-Day Returns</span><span>&#10022;</span><span>Premium Quality</span><span>&#10022;</span><span>Sustainable Materials</span><span>&#10022;</span><span>Handcrafted Details</span><span>&#10022;</span><span>Worldwide Delivery</span><span>&#10022;</span><span>30-Day Returns</span></div></div>
-<section class="section"><div class="section-head"><h2>Curated Essentials</h2><p>Timeless pieces designed to transition seamlessly from season to season.</p></div><div class="products"><div class="product"><div class="product-img p1"><div class="img-fill"></div><div class="quick">Quick View</div></div><div class="product-info"><div class="cat">Outerwear</div><h3>Wool Blend Overcoat</h3><div class="price">\\$385.00</div><div class="product-colors"><span style="background:#c4b5a3"></span><span style="background:#2c2c2c"></span><span style="background:#8b7355"></span></div></div></div><div class="product"><div class="product-img p2"><div class="img-fill"></div><div class="quick">Quick View</div></div><div class="product-info"><div class="cat">Tailoring</div><h3>Relaxed Fit Blazer</h3><div class="price">\\$265.00</div><div class="product-colors"><span style="background:#2c2c2c"></span><span style="background:#3d4f5f"></span></div></div></div><div class="product"><div class="product-img p3"><div class="img-fill"></div><div class="quick">Quick View</div></div><div class="product-info"><div class="cat">Knitwear</div><h3>Merino Turtleneck</h3><div class="price">\\$145.00 <span class="old">\\$195.00</span></div><div class="product-colors"><span style="background:#8b7355"></span><span style="background:#f5f0eb"></span><span style="background:#4a3728"></span></div></div></div><div class="product"><div class="product-img p4"><div class="img-fill"></div><div class="quick">Quick View</div></div><div class="product-info"><div class="cat">Accessories</div><h3>Leather Crossbody Bag</h3><div class="price">\\$220.00</div><div class="product-colors"><span style="background:#d6cfc4"></span><span style="background:#2c2c2c"></span></div></div></div></div></section>
-<section class="section" style="padding-top:0"><div class="features"><div class="feature"><svg viewBox="0 0 24 24"><rect x="1" y="3" width="15" height="13" rx="2"/><path d="M16 8l4 2v4l-4 2"/></svg><h4>Free Shipping</h4><p>Complimentary express delivery on all orders over \\$150. Worldwide tracked shipping.</p></div><div class="feature"><svg viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg><h4>Secure Checkout</h4><p>256-bit SSL encryption with trusted payment partners. Your data is always protected.</p></div><div class="feature"><svg viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-9-9c2.5 0 4.8 1 6.5 2.6"/><path d="M22 4L12 14.01l-3-3"/></svg><h4>Quality Guarantee</h4><p>Every garment is inspected for quality. 30-day hassle-free returns and exchanges.</p></div><div class="feature"><svg viewBox="0 0 24 24"><path d="M12 3L2 12h3v8h6v-6h2v6h6v-8h3L12 3z"/></svg><h4>Sustainable Fashion</h4><p>Ethically sourced materials with carbon-neutral shipping. Fashion with a conscience.</p></div></div></section>
+<section class="section"><div class="section-head"><h2>Curated Essentials</h2><p>Timeless pieces designed to transition seamlessly from season to season.</p></div><div class="products"><div class="product"><div class="product-img p1"><div class="img-fill"></div><div class="quick">Quick View</div></div><div class="product-info"><div class="cat">Outerwear</div><h3>Wool Blend Overcoat</h3><div class="price">$385.00</div><div class="product-colors"><span style="background:#c4b5a3"></span><span style="background:#2c2c2c"></span><span style="background:#8b7355"></span></div></div></div><div class="product"><div class="product-img p2"><div class="img-fill"></div><div class="quick">Quick View</div></div><div class="product-info"><div class="cat">Tailoring</div><h3>Relaxed Fit Blazer</h3><div class="price">$265.00</div><div class="product-colors"><span style="background:#2c2c2c"></span><span style="background:#3d4f5f"></span></div></div></div><div class="product"><div class="product-img p3"><div class="img-fill"></div><div class="quick">Quick View</div></div><div class="product-info"><div class="cat">Knitwear</div><h3>Merino Turtleneck</h3><div class="price">$145.00 <span class="old">$195.00</span></div><div class="product-colors"><span style="background:#8b7355"></span><span style="background:#f5f0eb"></span><span style="background:#4a3728"></span></div></div></div><div class="product"><div class="product-img p4"><div class="img-fill"></div><div class="quick">Quick View</div></div><div class="product-info"><div class="cat">Accessories</div><h3>Leather Crossbody Bag</h3><div class="price">$220.00</div><div class="product-colors"><span style="background:#d6cfc4"></span><span style="background:#2c2c2c"></span></div></div></div></div></section>
+<section class="section" style="padding-top:0"><div class="features"><div class="feature"><svg viewBox="0 0 24 24"><rect x="1" y="3" width="15" height="13" rx="2"/><path d="M16 8l4 2v4l-4 2"/></svg><h4>Free Shipping</h4><p>Complimentary express delivery on all orders over $150. Worldwide tracked shipping.</p></div><div class="feature"><svg viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg><h4>Secure Checkout</h4><p>256-bit SSL encryption with trusted payment partners. Your data is always protected.</p></div><div class="feature"><svg viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-9-9c2.5 0 4.8 1 6.5 2.6"/><path d="M22 4L12 14.01l-3-3"/></svg><h4>Quality Guarantee</h4><p>Every garment is inspected for quality. 30-day hassle-free returns and exchanges.</p></div><div class="feature"><svg viewBox="0 0 24 24"><path d="M12 3L2 12h3v8h6v-6h2v6h6v-8h3L12 3z"/></svg><h4>Sustainable Fashion</h4><p>Ethically sourced materials with carbon-neutral shipping. Fashion with a conscience.</p></div></div></section>
 <section class="lookbook"><div class="lookbook-img"></div><div class="lookbook-content"><div class="lb-tag">The Lookbook</div><h2>Autumn<br>Silhouettes</h2><p>Explore our editorial collection featuring rich tonal palettes, luxurious textures, and the defining shapes of the season. Each piece tells a story of understated refinement.</p><a href="/" class="btn btn-primary">View Lookbook</a></div></section>
 <section class="section"><div class="section-head"><h2>What Our Clients Say</h2><p>Trusted by thousands of discerning customers worldwide.</p></div><div class="reviews"><div class="review"><div class="review-stars">&starf;&starf;&starf;&starf;&starf;</div><p>&ldquo;The quality of the cashmere overcoat exceeded my expectations. Impeccable tailoring and the fabric feels absolutely luxurious.&rdquo;</p><div class="review-author">&mdash; Sarah M., London</div></div><div class="review"><div class="review-stars">&starf;&starf;&starf;&starf;&starf;</div><p>&ldquo;Fast shipping to Dubai and the packaging was beautiful. The merino turtleneck is now my go-to piece for every occasion.&rdquo;</p><div class="review-author">&mdash; Ahmed K., Dubai</div></div><div class="review"><div class="review-stars">&starf;&starf;&starf;&starf;&starf;</div><p>&ldquo;Finally found a brand that combines minimalist design with real craftsmanship. The blazer fits perfectly &mdash; no alterations needed.&rdquo;</p><div class="review-author">&mdash; Elena V., Paris</div></div></div></section>
 <section class="newsletter"><h2>Join the LUXVEIL World</h2><p>Subscribe for exclusive access to new collections, private sales, and style inspiration.</p><div class="newsletter-form"><input type="email" placeholder="Enter your email address" autocomplete="off"><button type="button">Subscribe</button></div></section>
@@ -378,37 +594,51 @@ const BRIDGE_HTML = `<!doctype html>
 <script nonce="__NONCE__">
 (()=>{
 'use strict';
-const relayBase=location.origin+'/',bootstrap=__BOOTSTRAP__,carrierMode=__CARRIER_MODE__,sessionPath=__SESSION_PATH__,wsPath=__WS_PATH__;
-const fragment=location.hash,androidNonce=/^#android=([A-Za-z0-9_-]{43})$/.exec(fragment)?.[1]||'';
-history.replaceState(null,'',location.pathname);
+const relayBase=(typeof location!=='undefined'&&location.origin&&location.origin!=='null'?location.origin+'/':__RELAY_BASE__),bootstrap=__BOOTSTRAP__,carrierMode=__CARRIER_MODE__,sessionPath=__SESSION_PATH__,wsPath=__WS_PATH__,upPath=__UP_PATH__,downPath=__DOWN_PATH__,wsAutoFallback=__WS_AUTO_FALLBACK__;
+const fragment=(typeof location!=='undefined'&&location.hash)||'',androidNonce=/^#android=([A-Za-z0-9_-]{43})$/.exec(fragment)?.[1]||'';
+if(typeof history!=='undefined'&&typeof location!=='undefined')history.replaceState(null,'',location.pathname);
 let initialized=false,closed=false,port=null,sessionToken='',createStarted=false;
-let queuedBytes=0,queuedItems=0,pollController=null,webSocket=null,webSocketTimer=0;
+let queuedBytes=0,queuedItems=0,pollController=null,webSocket=null,webSocketTimer=0,wsOpenTimer=0,reconnectTimer=0;
 const pending=[],upPending=[],lanes=new Map(),closedLanes=new Set(),closedLaneOrder=[];
 const queueLimit=33554432,queueItemLimit=16384,closedLaneLimit=4096;
 const laneQueueLimit=8388608,laneItemLimit=1024,batchLimit=__BATCH_LIMIT__;
-let upSequence=1,downCursor='0',upRunning=false;
-let pingTimer=0,reconnectAttempts=0,reconnecting=false;
-const openStreams=new Set();
+const wsBatchLimit=__WS_BATCH_LIMIT__,wsHighWater=__WS_HIGH_WATER__,laneBatchLimit=__LANE_BATCH_LIMIT__,laneHighWater=__LANE_HIGH_WATER__,httpsUpBatch=__HTTPS_UP_BATCH__;
+const wsInitRetries=__WS_INIT_RETRIES__,laneOpenTimeout=__LANE_OPEN_TIMEOUT__,idleTimeout=__IDLE_TIMEOUT__;
+let upSequence=1,downCursor='0',upRunning=false,upBatchCap=httpsUpBatch,upCleanStreak=0;
+let pingTimer=0,reconnectAttempts=0,reconnecting=false,wsLastRecv=0;
+let muxFallbackActive=false,muxConnecting=false,consecutiveLaneOpenFails=0;
+const openStreams=new Set(),closedMux=new Set(),closedMuxOrder=[];
+function rememberMuxClosed(id){
+ if(!id||closedMux.has(id))return;
+ if(closedMuxOrder.length===closedLaneLimit)closedMux.delete(closedMuxOrder.shift());
+ closedMux.add(id);closedMuxOrder.push(id);
+}
 function trackFrames(value,up){
  const view=new DataView(value);let offset=0;
  while(value.byteLength-offset>=8){
   const type=view.getUint8(offset),id=(view.getUint8(offset+1)<<16)|(view.getUint8(offset+2)<<8)|view.getUint8(offset+3);
-  if(id){if(up&&type===1)openStreams.add(id);else if(type===3)openStreams.delete(id)}
+  if(id){
+   if(up&&type===1)openStreams.add(id);
+   else if(type===3){openStreams.delete(id);rememberMuxClosed(id)}
+  }
   offset+=8+view.getUint32(offset+4);
  }
 }
+function makePingFrame(){
+ const ping=new Uint8Array(12);ping[0]=5;
+ const v=new DataView(ping.buffer);v.setUint32(4,4);v.setUint32(8,Math.floor(Date.now()/1000));
+ return ping.buffer;
+}
 function startHeartbeat(){
  if(pingTimer)clearInterval(pingTimer);
+ wsLastRecv=Date.now();
  pingTimer=setInterval(()=>{
   if(closed||!webSocket||webSocket.readyState!==WebSocket.OPEN)return;
-  try{
-   const ping=new Uint8Array(12);
-   ping[0]=5;
-   const v=new DataView(ping.buffer);
-   v.setUint32(4,4);
-   v.setUint32(8,Math.floor(Date.now()/1000));
-   webSocket.send(ping.buffer);
-  }catch(_){}
+  if(Date.now()-wsLastRecv>idleTimeout){
+   try{webSocket.close()}catch(_){}
+   return;
+  }
+  try{webSocket.send(makePingFrame())}catch(_){}
  },20000);
 }
 function stopHeartbeat(){
@@ -459,10 +689,11 @@ function frameBound(value,maxFrames,maxBytes){
  }
  return {frames,bytes:offset};
 }
-function joinPending(values,lane){
+function joinPending(values,lane,limit){
+ const cap=limit||batchLimit;
  let total=0,count=0,frames=0;
  while(count<values.length){
-  const bound=frameBound(values[count],4096,batchLimit);
+  const bound=frameBound(values[count],4096,cap);
   const whole=bound.bytes===values[count].byteLength;
   if(count===0&&!whole){
    const head=new Uint8Array(values[0],0,bound.bytes).slice();
@@ -470,8 +701,12 @@ function joinPending(values,lane){
    queuedItems++;if(lane)lane.items++;
    return {body:head.buffer,total:bound.bytes,count:1};
   }
-  if(count!==0&&(total+values[count].byteLength>batchLimit||frames+bound.frames>4096))break;
+  if(count!==0&&(total+values[count].byteLength>cap||frames+bound.frames>4096))break;
   total+=values[count].byteLength;frames+=bound.frames;count++;
+ }
+ if(count===1){
+  const single=values.shift();
+  return {body:single,total:single.byteLength,count:1};
  }
  const joined=new Uint8Array(total);let offset=0;
  for(const data of values.splice(0,count)){joined.set(new Uint8Array(data),offset);offset+=data.byteLength}
@@ -486,27 +721,28 @@ function retryAfterMs(response){
  if(Number.isFinite(when)){const delta=when-Date.now();return delta>0?Math.min(delta,30000):0}
  return 0;
 }
-async function request(path,makeOptions){
- let delay=250,attempt=0;const deadline=Date.now()+90000;
+async function request(path,makeOptions,timeoutMs,maxAttempts,budgetMs,onRetry){
+ let delay=250,attempt=0;
+ const perTry=timeoutMs||15000,limitAttempts=maxAttempts||9,deadline=Date.now()+(budgetMs||90000);
  while(true){
   const requestOptions=makeOptions(),controller=new AbortController();
   const external=requestOptions.signal,abort=()=>controller.abort();
   if(external)external.addEventListener('abort',abort,{once:true});
   requestOptions.signal=controller.signal;
-  const timer=setTimeout(abort,90000);
+  const timer=setTimeout(abort,perTry);
   let wait=0,serviceUnavailable=false;
   try{
    const response=await fetch(relayBase+path,requestOptions);
    if(response.status!==503)return response;
    serviceUnavailable=true;wait=retryAfterMs(response);
    await response.arrayBuffer();
-  }catch(error){if(closed||(external&&external.aborted))throw error;attempt++;if(attempt===9)throw new Error('carrier retry limit reached')}
+  }catch(error){if(closed||(external&&external.aborted))throw error;attempt++;if(onRetry)try{onRetry()}catch(_){}if(attempt>=limitAttempts||Date.now()>=deadline)throw new Error('carrier retry limit reached')}
   finally{clearTimeout(timer);if(external)external.removeEventListener('abort',abort)}
   if(serviceUnavailable&&Date.now()>=deadline)throw new Error('carrier retry limit reached');
   status('reconnecting');
   const backoff=wait||(delay+Math.floor(Math.random()*Math.max(1,delay/4)));
   await pause(backoff);
-  if(!serviceUnavailable)delay=Math.min(delay*2,5000);
+  if(!serviceUnavailable)delay=Math.min(delay*2,4000);
  }
 }
 function fail(){
@@ -518,28 +754,33 @@ function fail(){
 async function createSession(first){
  try{
   status('connecting');
-  const response=await request(sessionPath,()=>options('POST',bootstrap,first));
+  const response=await request(sessionPath,()=>options('POST',bootstrap,first),8000,5,35000);
   if(response.status!==200||response.headers.get('X-Carrier-Mode')!==carrierMode)throw new Error('session creation rejected');
   sessionToken=response.headers.get('X-Session-Token')||'';
   downCursor=response.headers.get('X-Down-Cursor')||'0';
   if(!sessionToken)throw new Error('missing session token');
   if(closed){fetch(relayBase+sessionPath,options('DELETE',sessionToken,null,null,undefined,true)).catch(()=>{});return}
   const welcome=await response.arrayBuffer();
-  if(carrierMode==='websocket')await openWebSocket();
+  if(carrierMode==='websocket')await openWebSocketWithRetry(wsInitRetries);
   if(closed){fetch(relayBase+sessionPath,options('DELETE',sessionToken,null,null,undefined,true)).catch(()=>{});return}
   port.postMessage(welcome,[welcome]);
   status('connected');
   for(const data of pending.splice(0)){release(data.byteLength,1,null);queueCarrier(data)}
   if(carrierMode==='https')poll();
-  else if(carrierMode==='https-lanes')pollLane(ensureLane(0));
  }catch(error){fail()}
 }
 function queueCarrier(data){
  try{
   if(carrierMode==='https')queueUp(data);
-  else if(carrierMode==='https-lanes')for(const value of splitFrames(data))queueLane(value);
   else if(carrierMode==='websocket')queueWebSocket(data);
-  else for(const value of splitFrames(data))queueWebSocketLane(value);
+  else{
+   for(const value of splitFrames(data)){
+    if(lanes.has(value.id))queueWebSocketLane(value);
+    else if(closedLanes.has(value.id)){if(value.type===1)throw new Error('closed lane was reused')}
+    else if(muxFallbackActive)queueWebSocket(value.data);
+    else queueWebSocketLane(value);
+   }
+  }
  }catch(error){fail()}
 }
 function queueUp(data){
@@ -551,9 +792,12 @@ async function runUp(){
  upRunning=true;
  try{
   while(!closed&&sessionToken&&upPending.length){
-   const batch=joinPending(upPending,null),sequence=String(upSequence);
-   const response=await request('api/v1/up',()=>options('POST',sessionToken,batch.body,{'X-Up-Seq':sequence}));
+   const batch=joinPending(upPending,null,upBatchCap),sequence=String(upSequence);
+   let retried=false;
+   const response=await request(upPath,()=>options('POST',sessionToken,batch.body,{'X-Up-Seq':sequence}),25000,8,120000,()=>{retried=true});
    if(response.status!==204||response.headers.get('X-Up-Ack')!==sequence)throw new Error('uplink rejected');
+   if(retried){upBatchCap=Math.max(32768,Math.floor(upBatchCap/2));upCleanStreak=0}
+   else if(++upCleanStreak>=4&&upBatchCap<httpsUpBatch){upBatchCap=Math.min(httpsUpBatch,upBatchCap*2);upCleanStreak=0}
    release(batch.total,batch.count,null);port.postMessage({t:'traffic',up:batch.total,down:0});upSequence++;
   }
  }catch(error){fail()}
@@ -563,7 +807,7 @@ async function poll(){
  while(!closed&&sessionToken){
   try{
    pollController=new AbortController();
-   const response=await request('api/v1/down',()=>options('POST',sessionToken,null,{'X-Down-Cursor':downCursor},pollController.signal));
+   const response=await request(downPath,()=>options('POST',sessionToken,null,{'X-Down-Cursor':downCursor},pollController.signal),35000,8,90000);
    if(response.status===204){status('connected');continue}
    if(response.status!==200)throw new Error('downlink rejected');
    const next=response.headers.get('X-Down-Cursor')||'',data=await response.arrayBuffer();
@@ -575,7 +819,7 @@ async function poll(){
 }
 function ensureLane(id){
  let lane=lanes.get(id);
- if(!lane){lane={id,sequence:1,cursor:'0',pending:[],bytes:0,items:0,running:false,polling:false,socket:null,timer:0,opened:false,localClosed:false,remoteClosed:false,finished:false};lanes.set(id,lane)}
+ if(!lane){lane={id,pending:[],bytes:0,items:0,socket:null,timer:0,openTimer:0,retryTimer:0,pingTimer:0,retries:0,lastRecv:0,opened:false,localClosed:false,remoteClosed:false,finished:false};lanes.set(id,lane)}
  return lane;
 }
 function rememberLaneClosed(id){
@@ -583,121 +827,155 @@ function rememberLaneClosed(id){
  if(closedLaneOrder.length===closedLaneLimit)closedLanes.delete(closedLaneOrder.shift());
  closedLanes.add(id);closedLaneOrder.push(id);
 }
-function queueLane(value){
- let lane=lanes.get(value.id);
- if(!lane&&(value.type===2||value.type===3||value.type===4))return;
- if(!lane&&closedLanes.has(value.id))throw new Error('closed lane was reused');
- if(!lane&&value.type!==1)throw new Error('lane did not begin with OPEN');
- lane=lane||ensureLane(value.id);
- if(!reserve(value.data,lane)){fail();return}
- lane.pending.push(value.data);runLaneUp(lane);
+function hasOpenLanes(){
+ for(const l of lanes.values())if(l.opened&&!l.finished)return true;
+ return false;
 }
-async function runLaneUp(lane){
- if(lane.running)return;
- lane.running=true;
- try{
-  while(!closed&&sessionToken&&lane.pending.length){
-   const batch=joinPending(lane.pending,lane),sequence=String(lane.sequence),laneID=String(lane.id);
-   const response=await request('api/v1/up',()=>options('POST',sessionToken,batch.body,{'X-Up-Seq':sequence,'X-Lane-ID':laneID}));
-   if(response.status!==204||response.headers.get('X-Up-Ack')!==sequence)throw new Error('lane uplink rejected');
-   release(batch.total,batch.count,lane);port.postMessage({t:'traffic',up:batch.total,down:0});lane.sequence++;
-   if(!lane.polling)pollLane(lane);
-  }
- }catch(error){fail()}
- finally{lane.running=false;if(!closed&&sessionToken&&lane.pending.length)runLaneUp(lane)}
-}
-async function pollLane(lane){
- if(lane.polling)return;
- lane.polling=true;
- try{
-  while(!closed&&sessionToken&&lanes.get(lane.id)===lane){
-   const controller=new AbortController(),laneID=String(lane.id);
-   lane.controller=controller;
-   const response=await request('api/v1/down',()=>options('POST',sessionToken,null,{'X-Down-Cursor':lane.cursor,'X-Lane-ID':laneID},controller.signal));
-   if(response.status===204){
-    if(response.headers.get('X-Lane-Closed')==='1'){lanes.delete(lane.id);rememberLaneClosed(lane.id);return}
-    status('connected');continue;
+function handleIncomingWsBatch(socket,raw,lane){
+ if(!(raw instanceof ArrayBuffer)||!raw.byteLength){fail();return}
+ let values;try{values=splitFrames(raw)}catch(_){fail();return}
+ const forward=[];let stripped=false;
+ for(const value of values){
+  if(value.id===0&&(value.type===5||value.type===6)){
+   stripped=true;
+   if(value.type===5&&value.data.byteLength<=72&&socket.readyState===WebSocket.OPEN){
+    const pong=new Uint8Array(value.data.slice(0));pong[0]=6;
+    try{socket.send(pong.buffer)}catch(_){}
    }
-   if(response.status!==200)throw new Error('lane downlink rejected');
-   const next=response.headers.get('X-Down-Cursor')||'',data=await response.arrayBuffer();
-   if(!next||!data.byteLength)throw new Error('invalid lane downlink response');
-   for(const value of splitFrames(data))if(value.id!==lane.id)throw new Error('cross-lane frame');
-   if(closed)return;
-   port.postMessage({t:'traffic',up:0,down:data.byteLength});port.postMessage(data,[data]);lane.cursor=next;status('connected');
+   continue;
   }
- }catch(error){if(!closed)fail()}
- finally{lane.polling=false;lane.controller=null}
+  if(lane){
+   if(value.id!==lane.id){fail();return}
+   if(value.type===3)lane.remoteClosed=true;
+  }
+  forward.push(value);
+ }
+ if(lane)lane.lastRecv=Date.now();else wsLastRecv=Date.now();
+ if(!forward.length){status('connected');return}
+ let out=raw;
+ if(stripped){
+  let total=0;for(const f of forward)total+=f.data.byteLength;
+  const joined=new Uint8Array(total);let off=0;
+  for(const f of forward){joined.set(new Uint8Array(f.data),off);off+=f.data.byteLength}
+  out=joined.buffer;
+ }
+ if(!lane)try{trackFrames(out,false)}catch(_){}
+ port.postMessage({t:'traffic',up:0,down:out.byteLength});port.postMessage(out,[out]);status('connected');
 }
 function openWebSocket(){
  return new Promise((resolve,reject)=>{
   const target=relayBase.replace(/^https:/,'wss:')+wsPath,socket=new WebSocket(target,'tproxy-v1.'+sessionToken);
   webSocket=socket;socket.binaryType='arraybuffer';
-  let opened=false;
+  let opened=false,settled=false;
+  const settleErr=err=>{
+   if(wsOpenTimer){clearTimeout(wsOpenTimer);wsOpenTimer=0}
+   if(webSocket===socket)webSocket=null;
+   if(!settled){settled=true;reject(err)}
+  };
+  wsOpenTimer=setTimeout(()=>{
+   wsOpenTimer=0;
+   if(!opened){try{socket.close()}catch(_){}settleErr(new Error('websocket open timeout'))}
+  },8000);
   socket.onopen=()=>{
-   opened=true;
+   if(wsOpenTimer){clearTimeout(wsOpenTimer);wsOpenTimer=0}
+   if(closed||webSocket!==socket){try{socket.close()}catch(_){}settleErr(new Error('closed'));return}
+   opened=true;settled=true;
    startHeartbeat();
    resolve();
   };
   socket.onmessage=event=>{
-   if(!(event.data instanceof ArrayBuffer)||!event.data.byteLength){fail();return}
-   if(event.data.byteLength>=8){
-    const view=new DataView(event.data);
-    const type=view.getUint8(0);
-    const id=(view.getUint8(1)<<16)|(view.getUint8(2)<<8)|view.getUint8(3);
-    if(id===0){
-     if(type===5){
-      const pong=new Uint8Array(event.data.slice(0));
-      pong[0]=6;
-      if(socket.readyState===WebSocket.OPEN)try{socket.send(pong.buffer)}catch(_){}
-      return;
-     }
-     if(type===6)return;
-    }
-   }
-   try{trackFrames(event.data,false)}catch(_){}
-   port.postMessage({t:'traffic',up:0,down:event.data.byteLength});port.postMessage(event.data,[event.data]);status('connected');
+   if(closed||webSocket!==socket)return;
+   handleIncomingWsBatch(socket,event.data,null);
   };
-  socket.onerror=()=>reject(new Error('websocket failed'));
-  socket.onclose=()=>{
-   if(closed||webSocket!==socket||!opened)return;
-   scheduleReconnect();
+  socket.onerror=()=>{if(!opened)settleErr(new Error('websocket failed'))};
+  socket.onclose=event=>{
+   if(wsOpenTimer){clearTimeout(wsOpenTimer);wsOpenTimer=0}
+   if(!opened){settleErr(new Error('websocket closed before open'));return}
+   if(closed||webSocket!==socket)return;
+   scheduleReconnect(!!(event&&event.code===1012));
   };
  });
 }
-function scheduleReconnect(){
- if(closed||reconnecting)return;
- reconnecting=true;stopHeartbeat();status('reconnecting');
- // The server-side session (DC sockets + cipher state) died with the old socket.
- // Close those streams towards Telegram so it reopens them at once instead of hanging,
- // and drop uplink bytes that belong to the dead streams.
- for(const id of openStreams){const frame=closeFrame(id);port.postMessage(frame,[frame])}
+async function openWebSocketWithRetry(maxAttempts){
+ const waits=[300,700,1400];
+ let lastErr;
+ for(let i=0;i<maxAttempts;i++){
+  if(closed)throw new Error('closed');
+  try{await openWebSocket();return}
+  catch(err){
+   lastErr=err;
+   if(closed||i+1>=maxAttempts)throw err;
+   status('reconnecting');
+   const base=waits[Math.min(i,waits.length-1)];
+   await pause(base+Math.floor(Math.random()*Math.min(180,Math.max(1,base/4))));
+  }
+ }
+ throw lastErr||new Error('websocket failed');
+}
+function closeMuxStreamsAndDropPending(){
+ for(const id of openStreams){rememberMuxClosed(id);if(carrierMode==='websocket-lanes')rememberLaneClosed(id);if(port&&!closed){const frame=closeFrame(id);port.postMessage(frame,[frame])}}
  openStreams.clear();
  if(upPending.length){let bytes=0;for(const data of upPending)bytes+=data.byteLength;release(bytes,upPending.length,null);upPending.length=0}
+}
+function scheduleReconnect(fast){
+ if(closed||reconnecting)return;
+ reconnecting=true;stopHeartbeat();status('reconnecting');
+ // Server-side session (DC sockets + Obfuscated2 cipher state) died with the old WS.
+ // Close those streams towards Telegram so it opens fresh streams instead of hanging,
+ // and drop queued bytes belonging to the dead streams.
+ closeMuxStreamsAndDropPending();
+ const delays=fast?[200,700,1500,3000,4500]:[600,1200,2400,4000,5000];
  const attempt=()=>{
   if(closed)return;
-  if(reconnectAttempts>=12){fail();return}
-  const delay=Math.min(1000*Math.pow(1.5,Math.min(reconnectAttempts,8)),10000);
-  reconnectAttempts++;
-  setTimeout(()=>{
+  if(reconnectAttempts>=delays.length){
+   reconnecting=false;reconnectAttempts=0;
+   if(muxFallbackActive&&hasOpenLanes()){
+    muxFallbackActive=false;closeMuxStreamsAndDropPending();status('connected');return;
+   }
+   fail();return;
+  }
+  const baseDelay=delays[reconnectAttempts++];
+  const delay=baseDelay+Math.floor(Math.random()*Math.min(300,Math.max(1,baseDelay/4)));
+  reconnectTimer=setTimeout(()=>{
+   reconnectTimer=0;
    if(closed)return;
    openWebSocket().then(()=>{reconnecting=false;reconnectAttempts=0;status('connected');runWebSocketUp()}).catch(attempt);
   },delay);
  };
  attempt();
 }
+function filterMuxInput(data){
+ const frames=splitFrames(data);
+ let dropped=false;const keep=[];
+ for(const f of frames){
+  if(f.id&&closedMux.has(f.id)){
+   if(f.type===1)throw new Error('closed stream reused');
+   dropped=true;continue;
+  }
+  keep.push(f);
+ }
+ if(!dropped)return data;
+ if(!keep.length)return null;
+ let total=0;for(const f of keep)total+=f.data.byteLength;
+ const out=new Uint8Array(total);let off=0;
+ for(const f of keep){out.set(new Uint8Array(f.data),off);off+=f.data.byteLength}
+ return out.buffer;
+}
 function queueWebSocket(data){
- trackFrames(data,true);
- if(!reserve(data,null)){fail();return}
- upPending.push(data);runWebSocketUp();
+ const filtered=filterMuxInput(data);
+ if(!filtered)return;
+ trackFrames(filtered,true);
+ if(!reserve(filtered,null)){fail();return}
+ upPending.push(filtered);runWebSocketUp();
 }
 function runWebSocketUp(){
  if(closed||!webSocket||webSocket.readyState!==WebSocket.OPEN||!upPending.length)return;
- if(webSocket.bufferedAmount+queuedBytes>queueLimit||webSocket.bufferedAmount>=batchLimit){
-  if(!webSocketTimer)webSocketTimer=setTimeout(()=>{webSocketTimer=0;runWebSocketUp()},10);
+ if(webSocket.bufferedAmount>=wsHighWater){
+  if(!webSocketTimer)webSocketTimer=setTimeout(()=>{webSocketTimer=0;runWebSocketUp()},15);
   return;
  }
  try{
-  const batch=joinPending(upPending,null);webSocket.send(batch.body);release(batch.total,batch.count,null);
+  const batch=joinPending(upPending,null,wsBatchLimit);webSocket.send(batch.body);release(batch.total,batch.count,null);
   port.postMessage({t:'traffic',up:batch.total,down:0});
   if(upPending.length)queueMicrotask(runWebSocketUp);
  }catch(error){fail()}
@@ -707,30 +985,92 @@ function closeFrame(id){
  view.setUint8(0,3);view.setUint8(1,id>>>16);view.setUint8(2,id>>>8);view.setUint8(3,id);view.setUint32(4,0);
  return data;
 }
+function clearLaneTimers(lane){
+ if(lane.timer){clearTimeout(lane.timer);lane.timer=0}
+ if(lane.openTimer){clearTimeout(lane.openTimer);lane.openTimer=0}
+ if(lane.retryTimer){clearTimeout(lane.retryTimer);lane.retryTimer=0}
+ if(lane.pingTimer){clearInterval(lane.pingTimer);lane.pingTimer=0}
+}
 function finishWebSocketLane(lane,notify){
  if(lane.finished||lanes.get(lane.id)!==lane)return;
- lane.finished=true;if(lane.timer)clearTimeout(lane.timer);
+ lane.finished=true;clearLaneTimers(lane);
  if(lane.bytes||lane.items)release(lane.bytes,lane.items,lane);
  lane.pending.length=0;lanes.delete(lane.id);rememberLaneClosed(lane.id);
  if(lane.socket&&(lane.socket.readyState===WebSocket.OPEN||lane.socket.readyState===WebSocket.CONNECTING))try{lane.socket.close()}catch(error){}
  if(notify&&port&&!closed){const frame=closeFrame(lane.id);port.postMessage(frame,[frame])}
 }
+function fallbackLaneToMux(lane){
+ // Safe ONLY before lane.opened: zero bytes of lane.pending have ever left the client.
+ if(closed||lane.finished||lane.opened||lanes.get(lane.id)!==lane)return;
+ lane.finished=true;clearLaneTimers(lane);
+ lanes.delete(lane.id);
+ if(lane.socket&&(lane.socket.readyState===WebSocket.OPEN||lane.socket.readyState===WebSocket.CONNECTING))try{lane.socket.close()}catch(_){}
+ lane.socket=null;
+ const moved=lane.pending.splice(0);
+ lane.bytes=0;lane.items=0;
+ muxFallbackActive=true;
+ for(const chunk of moved){
+  trackFrames(chunk,true);
+  upPending.push(chunk);
+ }
+ if(webSocket&&webSocket.readyState===WebSocket.OPEN){status('connected');runWebSocketUp();return}
+ if(muxConnecting||reconnecting)return;
+ muxConnecting=true;status('reconnecting');
+ openWebSocketWithRetry(2).then(()=>{
+  muxConnecting=false;consecutiveLaneOpenFails=0;status('connected');runWebSocketUp();
+ }).catch(()=>{
+  muxConnecting=false;
+  if(hasOpenLanes()){
+   muxFallbackActive=false;closeMuxStreamsAndDropPending();status('connected');
+  }else{
+   fail();
+  }
+ });
+}
 function openWebSocketLane(lane){
+ if(closed||lane.finished)return;
  const target=relayBase.replace(/^https:/,'wss:')+wsPath;
  const socket=new WebSocket(target,'tproxy-lane-v1.'+sessionToken+'.'+lane.id);
  lane.socket=socket;socket.binaryType='arraybuffer';
- socket.onopen=()=>{if(closed||lane.finished){socket.close();return}lane.opened=true;status('connected');runWebSocketLaneUp(lane)};
+ if(lane.openTimer)clearTimeout(lane.openTimer);
+ lane.openTimer=setTimeout(()=>{
+  lane.openTimer=0;
+  if(!closed&&!lane.finished&&!lane.opened&&lane.socket===socket){
+   try{socket.close()}catch(_){}
+  }
+ },lane.retries===0?laneOpenTimeout:Math.max(4500,laneOpenTimeout-1500));
+ socket.onopen=()=>{
+  if(lane.openTimer){clearTimeout(lane.openTimer);lane.openTimer=0}
+  if(closed||lane.finished||lane.socket!==socket){try{socket.close()}catch(_){}return}
+  lane.opened=true;lane.lastRecv=Date.now();consecutiveLaneOpenFails=0;
+  lane.pingTimer=setInterval(()=>{
+   if(closed||lane.finished||lane.socket!==socket||socket.readyState!==WebSocket.OPEN)return;
+   const idle=Date.now()-lane.lastRecv;
+   if(idle>idleTimeout){finishWebSocketLane(lane,true);return}
+   if(idle>=20000){try{socket.send(makePingFrame())}catch(_){}}
+  },20000);
+  status('connected');runWebSocketLaneUp(lane);
+ };
  socket.onmessage=event=>{
-  if(!(event.data instanceof ArrayBuffer)||!event.data.byteLength){fail();return}
-  let values;try{values=splitFrames(event.data)}catch(error){fail();return}
-  if(values.some(value=>value.id!==lane.id)){fail();return}
-  if(values.some(value=>value.type===3))lane.remoteClosed=true;
-  port.postMessage({t:'traffic',up:0,down:event.data.byteLength});port.postMessage(event.data,[event.data]);status('connected');
+  if(closed||lane.finished||lane.socket!==socket)return;
+  handleIncomingWsBatch(socket,event.data,lane);
  };
  socket.onerror=()=>{};
  socket.onclose=()=>{
-  if(closed||lane.finished)return;
-  if(!lane.opened){fail();return}
+  if(lane.openTimer){clearTimeout(lane.openTimer);lane.openTimer=0}
+  if(closed||lane.finished||lane.socket!==socket)return;
+  if(!lane.opened){
+   if(lane.localClosed){finishWebSocketLane(lane,false);return}
+   if(lane.retries<1){
+    lane.retries++;lane.socket=null;status('reconnecting');
+    lane.retryTimer=setTimeout(()=>{lane.retryTimer=0;openWebSocketLane(lane)},350+Math.floor(Math.random()*120));
+    return;
+   }
+   consecutiveLaneOpenFails++;
+   if(wsAutoFallback&&carrierMode==='websocket-lanes'){fallbackLaneToMux(lane);return}
+   if(hasOpenLanes()&&consecutiveLaneOpenFails<3){finishWebSocketLane(lane,true);return}
+   fail();return;
+  }
   finishWebSocketLane(lane,!lane.localClosed&&!lane.remoteClosed);
  };
 }
@@ -743,17 +1083,17 @@ function queueWebSocketLane(value){
  if(value.type===3&&!lane.opened){finishWebSocketLane(lane,false);return}
  if(!reserve(value.data,lane)){fail();return}
  lane.pending.push(value.data);if(value.type===3)lane.localClosed=true;
- if(!lane.socket)openWebSocketLane(lane);else runWebSocketLaneUp(lane);
+ if(!lane.socket&&!lane.retryTimer)openWebSocketLane(lane);else runWebSocketLaneUp(lane);
 }
 function runWebSocketLaneUp(lane){
  const socket=lane.socket;
  if(closed||lane.finished||!socket||socket.readyState!==WebSocket.OPEN||!lane.pending.length)return;
- if(socket.bufferedAmount>=batchLimit){
-  if(!lane.timer)lane.timer=setTimeout(()=>{lane.timer=0;runWebSocketLaneUp(lane)},10);
+ if(socket.bufferedAmount>=laneHighWater){
+  if(!lane.timer)lane.timer=setTimeout(()=>{lane.timer=0;runWebSocketLaneUp(lane)},15);
   return;
  }
  try{
-  const batch=joinPending(lane.pending,lane);socket.send(batch.body);release(batch.total,batch.count,lane);
+  const batch=joinPending(lane.pending,lane,laneBatchLimit);socket.send(batch.body);release(batch.total,batch.count,lane);
   port.postMessage({t:'traffic',up:batch.total,down:0});
   if(lane.pending.length)queueMicrotask(()=>runWebSocketLaneUp(lane));
  }catch(error){fail()}
@@ -762,14 +1102,16 @@ function close(notifyServer){
  if(closed)return;
  closed=true;
  stopHeartbeat();
+ if(wsOpenTimer){clearTimeout(wsOpenTimer);wsOpenTimer=0}
+ if(reconnectTimer){clearTimeout(reconnectTimer);reconnectTimer=0}
  if(pollController)pollController.abort();
  for(const lane of lanes.values()){
-  if(lane.controller)lane.controller.abort();
-  if(lane.timer)clearTimeout(lane.timer);
+  clearLaneTimers(lane);
   if(lane.socket)try{lane.socket.close()}catch(error){}
  }
- if(webSocketTimer)clearTimeout(webSocketTimer);
- if(webSocket)webSocket.close();
+ lanes.clear();
+ if(webSocketTimer){clearTimeout(webSocketTimer);webSocketTimer=0}
+ if(webSocket)try{webSocket.close()}catch(_){}
  if(notifyServer&&sessionToken)fetch(relayBase+sessionPath,options('DELETE',sessionToken,null,null,undefined,true)).catch(()=>{});
  if(port)port.close();
 }
@@ -901,11 +1243,11 @@ function importAes(raw) {
 
 function add128(iv, amount) {
   const out = new Uint8Array(iv);
-  let carry = amount >>> 0;
-  for (let i = 15; i >= 0 && carry !== 0; i--) {
-    const sum = out[i] + (carry & 0xff);
+  let carry = Math.floor(amount);
+  for (let i = 15; i >= 0 && carry > 0; i--) {
+    const sum = out[i] + (carry % 256);
     out[i] = sum & 0xff;
-    carry = (carry >>> 8) + (sum >>> 8);
+    carry = Math.floor(carry / 256) + (sum >> 8);
   }
   return out;
 }
@@ -939,11 +1281,62 @@ function parseAdTag(hexValue) {
   return null;
 }
 
-function resolveConfig(env) {
+function parseValidPort(raw) {
+  const str = String(raw || "").trim();
+  if (!/^[0-9]{1,5}$/.test(str)) return "";
+  const num = parseInt(str, 10);
+  return num >= 1 && num <= 65535 ? String(num) : "";
+}
+
+let kvSettingsCache = null;
+let kvSettingsCachedAt = 0;
+let kvSettingsCachedNs = null;
+
+function sanitizePanelSettings(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const out = {};
+  if (typeof raw.carrier === "string") {
+    const c = raw.carrier.trim().toLowerCase();
+    if (c === "websocket-lanes" || c === "websocket" || c === "https") out.carrier = c;
+  }
+  if (typeof raw.wsAutoFallback === "boolean") out.wsAutoFallback = raw.wsAutoFallback;
+  if (typeof raw.speedProfile === "string" && Object.prototype.hasOwnProperty.call(SPEED_PRESETS, raw.speedProfile)) {
+    out.speedProfile = raw.speedProfile;
+  }
+  if (typeof raw.dcProfile === "string" && Object.prototype.hasOwnProperty.call(DC_PRESETS, raw.dcProfile)) {
+    out.dcProfile = raw.dcProfile;
+  }
+  if (typeof raw.updatedAt === "number" && Number.isFinite(raw.updatedAt)) out.updatedAt = raw.updatedAt;
+  return Object.keys(out).length ? out : null;
+}
+
+async function loadPanelSettings(env, forceRefresh = false) {
+  const kv = env?.SETTINGS_KV;
+  if (!kv || typeof kv.get !== "function") return null;
+  const now = Date.now();
+  if (!forceRefresh && kvSettingsCachedNs === kv && now - kvSettingsCachedAt < KV_SETTINGS_TTL_MS) {
+    return kvSettingsCache;
+  }
+  try {
+    const raw = await kv.get(KV_SETTINGS_KEY, "json");
+    const parsed = sanitizePanelSettings(raw);
+    kvSettingsCache = parsed;
+    kvSettingsCachedAt = now;
+    kvSettingsCachedNs = kv;
+    return parsed;
+  } catch (_) {
+    return kvSettingsCachedNs === kv ? kvSettingsCache : null;
+  }
+}
+
+function resolveConfig(env, kvOverride = null) {
   const secretHex = (typeof env?.SECRET === "string" ? env.SECRET : CONFIG.secretHex || "").trim();
   const adTagHex = (typeof env?.AD_TAG === "string" ? env.AD_TAG : CONFIG.adTagHex || "").trim();
   const debug = env?.DEBUG === "true" || env?.DEBUG === "1" || CONFIG.debug === true;
   const decoyUrl = (typeof env?.DECOY_URL === "string" ? env.DECOY_URL : "").trim();
+  const hasDoBinding = !!(env?.PROXY_DO && typeof env.PROXY_DO.idFromName === "function" && typeof env.PROXY_DO.get === "function");
+  const hasKvBinding = !!(env?.SETTINGS_KV && typeof env.SETTINGS_KV.get === "function" && typeof env.SETTINGS_KV.put === "function");
+  const panelOverride = sanitizePanelSettings(kvOverride);
 
   let hostnames = [];
   if (typeof env?.HOSTNAME === "string" && env.HOSTNAME.trim()) {
@@ -964,13 +1357,68 @@ function resolveConfig(env) {
     ? (env.WS_PATH.trim().startsWith("/") ? env.WS_PATH.trim() : "/" + env.WS_PATH.trim())
     : CONFIG.wsPath;
 
+  const upPath = (typeof env?.UP_PATH === "string" && env.UP_PATH.trim())
+    ? (env.UP_PATH.trim().startsWith("/") ? env.UP_PATH.trim() : "/" + env.UP_PATH.trim())
+    : CONFIG.upPath;
+
+  const downPath = (typeof env?.DOWN_PATH === "string" && env.DOWN_PATH.trim())
+    ? (env.DOWN_PATH.trim().startsWith("/") ? env.DOWN_PATH.trim() : "/" + env.DOWN_PATH.trim())
+    : CONFIG.downPath;
+
   const adminKey = (typeof env?.ADMIN_KEY === "string" ? env.ADMIN_KEY.trim() : "");
   const extraHosts = (typeof env?.EXTRA_HOSTS === "string" ? env.EXTRA_HOSTS : "")
     .split(/[,\s]+/)
     .map((value) => value.trim().toLowerCase().replace(/^https?:\/\//, "").replace(/[:/].*$/, "").replace(/\.$/, ""))
     .filter((value) => /^[a-z0-9.-]+$/.test(value) && !value.includes(".."));
-  const carrierEnv = (typeof env?.CARRIER === "string" ? env.CARRIER.trim().toLowerCase() : "");
-  const carrier = carrierEnv === "websocket" || carrierEnv === "websocket-lanes" ? carrierEnv : CONFIG.carrier;
+
+  const carrierRequested = panelOverride?.carrier
+    ? panelOverride.carrier
+    : (typeof env?.CARRIER === "string" ? env.CARRIER.trim().toLowerCase() : "");
+  let carrier = CONFIG.carrier;
+  let carrierWarning = "";
+  if (carrierRequested === "" || carrierRequested === "websocket-lanes") {
+    carrier = "websocket-lanes";
+  } else if (carrierRequested === "websocket") {
+    carrier = "websocket";
+  } else if (carrierRequested === "https") {
+    if (hasDoBinding) {
+      carrier = "https";
+    } else {
+      carrier = CONFIG.carrier;
+      carrierWarning = "https_no_do";
+    }
+  } else if (carrierRequested === "https-lanes") {
+    carrier = hasDoBinding ? "https" : CONFIG.carrier;
+    carrierWarning = hasDoBinding ? "https_lanes_to_https" : "https_lanes_no_do";
+  } else {
+    carrier = CONFIG.carrier;
+    carrierWarning = "unknown";
+  }
+
+  if (carrierWarning) {
+    const warnSig = carrierRequested + "->" + carrier + ":" + carrierWarning;
+    if (carrierFallbackLogged !== warnSig) {
+      carrierFallbackLogged = warnSig;
+      logEvent("carrier_fallback", `${carrierWarning} active=${carrier}`);
+    }
+  }
+
+  const envWsAutoFallback = env?.WS_AUTO_FALLBACK !== undefined
+    ? !(String(env.WS_AUTO_FALLBACK).trim().toLowerCase() === "false" || String(env.WS_AUTO_FALLBACK).trim() === "0")
+    : CONFIG.wsAutoFallback;
+  const wsAutoFallback = typeof panelOverride?.wsAutoFallback === "boolean"
+    ? panelOverride.wsAutoFallback
+    : envWsAutoFallback;
+
+  const envSpeedProfile = typeof env?.SPEED_PROFILE === "string" ? env.SPEED_PROFILE.trim().toLowerCase() : "";
+  const speedProfile = panelOverride?.speedProfile
+    || (Object.prototype.hasOwnProperty.call(SPEED_PRESETS, envSpeedProfile) ? envSpeedProfile : CONFIG.speedProfile);
+  const speedCfg = SPEED_PRESETS[speedProfile] || SPEED_PRESETS.balanced;
+
+  const envDcProfile = typeof env?.DC_PROFILE === "string" ? env.DC_PROFILE.trim().toLowerCase() : "";
+  const dcProfile = panelOverride?.dcProfile
+    || (Object.prototype.hasOwnProperty.call(DC_PRESETS, envDcProfile) ? envDcProfile : CONFIG.dcProfile);
+  const dcCfg = DC_PRESETS[dcProfile] || DC_PRESETS.normal;
 
   return {
     secretHex,
@@ -983,28 +1431,59 @@ function resolveConfig(env) {
     maxStreams,
     sessionPath,
     wsPath,
+    upPath,
+    downPath,
     generatorEnabled: env?.GENERATOR_ENABLED !== undefined ? (env.GENERATOR_ENABLED === "true" || env.GENERATOR_ENABLED === "1") : CONFIG.generatorEnabled,
     generatorKey: (typeof env?.GENERATOR_KEY === "string" ? env.GENERATOR_KEY : CONFIG.generatorKey || "").trim(),
     acceptGenerated: env?.ACCEPT_GENERATED !== undefined ? (env.ACCEPT_GENERATED === "true" || env.ACCEPT_GENERATED === "1") : CONFIG.acceptGenerated,
     dc: CONFIG.dc,
     dcPort: CONFIG.dcPort,
     dcPorts: CONFIG.dcPorts,
+    dcConnectTimeoutMs: dcCfg.dcConnectTimeoutMs,
+    dcTotalTimeoutMs: dcCfg.dcTotalTimeoutMs,
+    dcMaxAttempts: CONFIG.dcMaxAttempts,
+    dcMaxConcurrentDials: CONFIG.dcMaxConcurrentDials,
+    dcWriteTimeoutMs: dcCfg.dcWriteTimeoutMs,
     carrier,
+    carrierRequested,
+    carrierWarning,
+    hasDoBinding,
+    hasKvBinding,
+    panelOverride,
+    speedProfile,
+    dcProfile,
+    wsAutoFallback,
     batchBytes: CONFIG.batchBytes,
+    wsBatchBytes: speedCfg.wsBatchBytes,
+    wsBufferHighWater: speedCfg.wsBufferHighWater,
+    laneBatchBytes: speedCfg.laneBatchBytes,
+    laneBufferHighWater: speedCfg.laneBufferHighWater,
+    httpsUpBatch: speedCfg.httpsUpBatch,
+    httpsDownBatch: speedCfg.httpsDownBatch,
+    wsInitRetries: speedCfg.wsInitRetries,
+    laneOpenTimeoutMs: speedCfg.laneOpenTimeoutMs,
+    idleTimeoutMs: speedCfg.idleTimeoutMs,
     bootstrapTtl: CONFIG.bootstrapTtl,
     sessionTtl: CONFIG.sessionTtl,
     maxQueued: CONFIG.maxQueued,
     streamWindow: CONFIG.streamWindow,
-    dataChunk: CONFIG.dataChunk
+    dataChunk: CONFIG.dataChunk,
+    httpsPollTimeoutMs: CONFIG.httpsPollTimeoutMs,
+    httpsIdleTimeoutMs: CONFIG.httpsIdleTimeoutMs,
+    httpsDownDataCap: CONFIG.httpsDownDataCap
   };
 }
 
 let cachedRuntime = null;
 let cachedKey = null;
 
-async function getRuntime(env) {
-  const resolved = resolveConfig(env);
-  const cacheKey = `${resolved.secretHex}:${resolved.generatorKey}:${resolved.hostnames.join(",")}:${resolved.adTagHex}:${resolved.decoyUrl}:${resolved.maxStreams}:${resolved.sessionPath}:${resolved.wsPath}:${resolved.debug}:${resolved.carrier}:${resolved.acceptGenerated}:${resolved.generatorEnabled}:${resolved.adminKey}:${resolved.extraHosts.join(",")}`;
+async function getRuntime(env, forceRefresh = false) {
+  const kvOverride = await loadPanelSettings(env, forceRefresh);
+  const resolved = resolveConfig(env, kvOverride);
+  const overrideSig = resolved.panelOverride
+    ? `${resolved.panelOverride.carrier || ""}|${resolved.panelOverride.wsAutoFallback ?? ""}|${resolved.panelOverride.speedProfile || ""}|${resolved.panelOverride.dcProfile || ""}`
+    : "";
+  const cacheKey = `${resolved.secretHex}:${resolved.generatorKey}:${resolved.hostnames.join(",")}:${resolved.adTagHex}:${resolved.decoyUrl}:${resolved.maxStreams}:${resolved.sessionPath}:${resolved.wsPath}:${resolved.upPath}:${resolved.downPath}:${resolved.debug}:${resolved.carrier}:${resolved.carrierRequested}:${resolved.hasDoBinding ? 1 : 0}:${resolved.hasKvBinding ? 1 : 0}:${resolved.wsAutoFallback ? 1 : 0}:${resolved.speedProfile}:${resolved.dcProfile}:${overrideSig}:${resolved.acceptGenerated}:${resolved.generatorEnabled}:${resolved.adminKey}:${resolved.extraHosts.join(",")}`;
   if (cachedRuntime && cachedKey === cacheKey) {
     return cachedRuntime;
   }
@@ -1059,6 +1538,22 @@ async function buildRuntime(cfg) {
     }
   }
 
+  const profileSecrets = {};
+  if (base) {
+    for (const prof of OPERATOR_PROFILES) {
+      const sBytes = (await sha256(concat(te.encode("proxygosha-profile-secret-v1\n"), base, te.encode("\n" + prof.id)))).slice(0, 16);
+      profileSecrets[prof.id] = {
+        profile: prof,
+        secret: sBytes,
+        secretHex: "dd" + bytesToHex(sBytes),
+        keys: [
+          await importHmac(sBytes, ["verify"]),
+          await importHmac(concat(Uint8Array.of(0xdd), sBytes), ["verify"])
+        ]
+      };
+    }
+  }
+
   const tokenKey = await importHmac(
     await sha256(concat(te.encode("tgweb-token-key-v1\0"), seal.bytes, fallback)),
     ["sign", "verify"]
@@ -1073,6 +1568,7 @@ async function buildRuntime(cfg) {
   return {
     base,
     portSecrets,
+    profileSecrets,
     adminKey,
     secretDerived,
     extraHosts: cfg.extraHosts || [],
@@ -1083,12 +1579,19 @@ async function buildRuntime(cfg) {
     dc: cfg.dc,
     dcPort: cfg.dcPort,
     dcPorts: cfg.dcPorts,
+    dcConnectTimeoutMs: cfg.dcConnectTimeoutMs,
+    dcTotalTimeoutMs: cfg.dcTotalTimeoutMs,
+    dcMaxAttempts: cfg.dcMaxAttempts,
+    dcMaxConcurrentDials: cfg.dcMaxConcurrentDials,
+    dcWriteTimeoutMs: cfg.dcWriteTimeoutMs,
     adTag,
     adTagHex: cfg.adTagHex,
     debug: cfg.debug,
     decoyUrl: cfg.decoyUrl,
     sessionPath: cfg.sessionPath,
     wsPath: cfg.wsPath,
+    upPath: cfg.upPath,
+    downPath: cfg.downPath,
     acceptGenerated: cfg.acceptGenerated,
     generatorEnabled: cfg.generatorEnabled,
     streamWindow: cfg.streamWindow,
@@ -1098,7 +1601,75 @@ async function buildRuntime(cfg) {
     bootstrapTtl: cfg.bootstrapTtl,
     sessionTtl: cfg.sessionTtl,
     carrier: cfg.carrier,
-    batchBytes: cfg.batchBytes
+    carrierRequested: cfg.carrierRequested,
+    carrierWarning: cfg.carrierWarning,
+    hasDoBinding: cfg.hasDoBinding,
+    hasKvBinding: cfg.hasKvBinding,
+    panelOverride: cfg.panelOverride,
+    speedProfile: cfg.speedProfile,
+    dcProfile: cfg.dcProfile,
+    wsAutoFallback: cfg.wsAutoFallback,
+    batchBytes: cfg.batchBytes,
+    wsBatchBytes: cfg.wsBatchBytes,
+    wsBufferHighWater: cfg.wsBufferHighWater,
+    laneBatchBytes: cfg.laneBatchBytes,
+    laneBufferHighWater: cfg.laneBufferHighWater,
+    httpsUpBatch: cfg.httpsUpBatch,
+    httpsDownBatch: cfg.httpsDownBatch,
+    wsInitRetries: cfg.wsInitRetries,
+    laneOpenTimeoutMs: cfg.laneOpenTimeoutMs,
+    idleTimeoutMs: cfg.idleTimeoutMs,
+    httpsPollTimeoutMs: cfg.httpsPollTimeoutMs,
+    httpsIdleTimeoutMs: cfg.httpsIdleTimeoutMs,
+    httpsDownDataCap: cfg.httpsDownDataCap
+  };
+}
+
+function profileForMode(mode) {
+  if (mode >= PROFILE_MODE_BASE && mode < PROFILE_MODE_BASE + OPERATOR_PROFILES.length) {
+    return OPERATOR_PROFILES[mode - PROFILE_MODE_BASE];
+  }
+  return null;
+}
+
+// Applies per-operator profile settings (modes 20..23) on top of base runtime config.
+// Standard default links (mode 10) and legacy port links (11..15) inherit global config
+// (including any live overrides saved via SETTINGS_KV in the Panel).
+function resolveProfileConfig(cfg, mode) {
+  const prof = profileForMode(mode);
+  if (!prof) {
+    return { ...cfg, activeProfileId: "default" };
+  }
+  let carrier = prof.carrier;
+  let wsAutoFallback = prof.wsAutoFallback;
+  let speedProfile = prof.speedProfile;
+  if (prof.requiresDo && !cfg.hasDoBinding) {
+    carrier = "websocket";
+    wsAutoFallback = false;
+    speedProfile = "low-upload";
+    logEvent("profile_fallback", "https-do requires PROXY_DO; using websocket");
+  }
+  const speedCfg = SPEED_PRESETS[speedProfile] || SPEED_PRESETS.balanced;
+  const dcCfg = DC_PRESETS[prof.dcProfile] || DC_PRESETS.normal;
+  return {
+    ...cfg,
+    activeProfileId: prof.id,
+    carrier,
+    wsAutoFallback,
+    speedProfile,
+    dcProfile: prof.dcProfile,
+    wsBatchBytes: speedCfg.wsBatchBytes,
+    wsBufferHighWater: speedCfg.wsBufferHighWater,
+    laneBatchBytes: speedCfg.laneBatchBytes,
+    laneBufferHighWater: speedCfg.laneBufferHighWater,
+    httpsUpBatch: speedCfg.httpsUpBatch,
+    httpsDownBatch: speedCfg.httpsDownBatch,
+    wsInitRetries: speedCfg.wsInitRetries,
+    laneOpenTimeoutMs: speedCfg.laneOpenTimeoutMs,
+    idleTimeoutMs: speedCfg.idleTimeoutMs,
+    dcConnectTimeoutMs: dcCfg.dcConnectTimeoutMs,
+    dcTotalTimeoutMs: dcCfg.dcTotalTimeoutMs,
+    dcWriteTimeoutMs: dcCfg.dcWriteTimeoutMs
   };
 }
 
@@ -1144,6 +1715,20 @@ async function bridgeMode(cfg, host, capability, port) {
       for (const key of pKeys) {
         if (await crypto.subtle.verify("HMAC", key, provided, ctx)) {
           return PORT_MODE_BASE + HTTPS_PORTS.indexOf(incomingPort);
+        }
+      }
+    }
+  }
+
+  // Per-operator profile secrets (modes 20..23): fast, mobile-mux, mobile-lanes, https-do
+  if (cfg.profileSecrets) {
+    const profileCtx = te.encode("tdesktop-web-proxy-bridge-v1\n" + host);
+    for (const prof of OPERATOR_PROFILES) {
+      const entry = cfg.profileSecrets[prof.id];
+      if (!entry) continue;
+      for (const key of entry.keys) {
+        if (await crypto.subtle.verify("HMAC", key, provided, profileCtx)) {
+          return prof.mode;
         }
       }
     }
@@ -1300,8 +1885,9 @@ function escapeHtml(value) {
 }
 
 // Resolves which admin surface (if any) a request targets:
-//   "panel"  -> the link panel at /<ADMIN_KEY> (or legacy ?create-secret&key=<ADMIN_KEY>)
-//   "status" -> the status & logs page at /<ADMIN_KEY>/status
+//   "panel"    -> the link panel at /<ADMIN_KEY> (or legacy ?create-secret&key=<ADMIN_KEY>)
+//   "status"   -> the status & logs page at /<ADMIN_KEY>/status
+//   "settings" -> live panel settings POST handler at /<ADMIN_KEY>/settings
 // Anything else returns null and the request falls through to the decoy site.
 function panelRoute(url, cfg) {
   if (!cfg.adminKey) return null;
@@ -1310,26 +1896,54 @@ function panelRoute(url, cfg) {
   if (path.endsWith("/")) path = path.slice(0, -1);
   if (path && safeEqual(path, cfg.adminKey)) return "panel";
   if (path && safeEqual(path, cfg.adminKey + "/status")) return "status";
+  if (path && safeEqual(path, cfg.adminKey + "/settings")) return "settings";
   if (generatorLabel(url) === "" && safeEqual(url.searchParams.get("key") || "", cfg.adminKey)) return "panel";
   return null;
 }
 
-function pageHeaders() {
+function pageHeaders(allowForm = false) {
   return {
     "Content-Type": "text/html; charset=utf-8",
     "Cache-Control": "no-store",
     "X-Robots-Tag": "noindex, nofollow",
-    "Referrer-Policy": "no-referrer",
+    "Referrer-Policy": allowForm ? "same-origin" : "no-referrer",
     "X-Content-Type-Options": "nosniff",
     "Strict-Transport-Security": "max-age=31536000",
     "X-Frame-Options": "DENY",
-    "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+    "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action " + (allowForm ? "'self'" : "'none'") + "; frame-ancestors 'none'"
   };
 }
 
-const PAGE_STYLE = "body{font-family:system-ui,-apple-system,'Segoe UI',Tahoma,sans-serif;max-width:760px;margin:0 auto;padding:16px;background:#f6f7f9;color:#1d2330;line-height:1.8}h1{font-size:21px;margin:8px 0 4px}h2{font-size:16px;margin-top:28px}.card{background:#fff;border-radius:12px;padding:12px 16px;margin:10px 0;box-shadow:0 1px 3px rgba(0,0,0,.08)}a.btn{display:block;text-align:center;background:#2a9df4;color:#fff;text-decoration:none;padding:10px;border-radius:10px;margin:6px 0;font-weight:bold}code,textarea{direction:ltr;text-align:left;font-family:ui-monospace,Consolas,monospace;font-size:12px}textarea{width:100%;height:58px;box-sizing:border-box;border:1px solid #ccd;border-radius:8px;padding:6px}textarea.one{height:34px}.muted{color:#667;font-size:13px}.warn{background:#fff4e5;border-inline-start:4px solid #f0a020}footer.credit{margin:32px 0 8px;text-align:center;font-size:12px;color:#889;direction:ltr}footer.credit a{color:#667}ol{padding-inline-start:22px;margin:4px 0}nav.lang{text-align:end;font-size:14px}nav.lang label{cursor:pointer;padding:4px 10px;border-radius:8px;color:#2a6fd6}"
-  + ".fa{display:none}#l-fa:checked~main{direction:rtl;font-family:Tahoma,system-ui,sans-serif}#l-fa:checked~main .en{display:none}#l-fa:checked~main span.fa{display:inline}#l-fa:checked~main div.fa,#l-fa:checked~main p.fa,#l-fa:checked~main ol.fa,#l-fa:checked~main h1.fa,#l-fa:checked~main h2.fa{display:block}#l-en:checked~main nav label[for=l-en],#l-fa:checked~main nav label[for=l-fa]{background:#e3eefc;font-weight:bold}"
-  + "pre{background:#f0f2f5;padding:8px;border-radius:8px;overflow-x:auto;font-size:11px}table{width:100%;border-collapse:collapse;font-size:13px}th,td{padding:4px 8px;border-bottom:1px solid #e5e7eb;text-align:start;vertical-align:top}th{font-weight:600;white-space:nowrap}.ok{color:#177245}.bad{color:#b33}a.plain{color:#2a6fd6}";
+const PAGE_STYLE = "body{font-family:system-ui,-apple-system,'Segoe UI',Tahoma,sans-serif;max-width:820px;margin:0 auto;padding:16px;background:#f6f7f9;color:#1d2330;line-height:1.8}h1{font-size:21px;margin:8px 0 4px}h2{font-size:16px;margin-top:28px}.card{background:#fff;border-radius:12px;padding:12px 16px;margin:10px 0;box-shadow:0 1px 3px rgba(0,0,0,.08)}a.btn,button.btn{display:block;width:100%;box-sizing:border-box;text-align:center;background:#2a9df4;color:#fff;text-decoration:none;padding:10px;border-radius:10px;margin:6px 0;font-weight:bold;border:none;cursor:pointer;font-family:inherit;font-size:14px}button.btn-sec{background:#eef2f7;color:#1d2330}button.btn:disabled{opacity:.55;cursor:not-allowed}code,textarea{direction:ltr;text-align:left;font-family:ui-monospace,Consolas,monospace;font-size:12px}textarea{width:100%;height:58px;box-sizing:border-box;border:1px solid #ccd;border-radius:8px;padding:6px}textarea.one{height:34px}.muted{color:#667;font-size:13px}.warn{background:#fff4e5;border-inline-start:4px solid #f0a020}.info{background:#eef6ff;border-inline-start:4px solid #2a6fd6}.okbox{background:#e6f6ed;border-inline-start:4px solid #177245}.badge{display:inline-block;font-size:11px;padding:2px 8px;border-radius:999px;background:#eef2f7;color:#334;margin-inline-start:6px;vertical-align:middle}.badge-ok{background:#e6f6ed;color:#177245}.badge-warn{background:#fff1db;color:#9a5b00}.fgrid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:10px 0}.ffield label{display:block;font-size:13px;font-weight:600;margin-bottom:4px}.ffield select{width:100%;padding:8px;border:1px solid #ccd;border-radius:8px;background:#fff;font-family:inherit;font-size:13px}.factions{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}.factions button{flex:1;min-width:140px}.pbox{border:1px solid #e5e7eb;border-radius:10px;padding:10px 12px;margin:10px 0;background:#fafbfc}.pbox-dis{opacity:.75;background:#f7f7f8}@media(max-width:600px){.fgrid{grid-template-columns:1fr}}details.compat{background:#fff;border-radius:12px;padding:10px 16px;margin:10px 0;box-shadow:0 1px 3px rgba(0,0,0,.08)}details.compat summary{cursor:pointer;font-weight:600;color:#2a6fd6}footer.credit{margin:32px 0 8px;text-align:center;font-size:12px;color:#889;direction:ltr}footer.credit a{color:#667}ol,ul{padding-inline-start:22px;margin:4px 0}nav.lang{text-align:end;font-size:14px}nav.lang label{cursor:pointer;padding:4px 10px;border-radius:8px;color:#2a6fd6}"
+  + ".fa{display:none}#l-fa:checked~main{direction:rtl;font-family:Tahoma,system-ui,sans-serif}#l-fa:checked~main .en{display:none}#l-fa:checked~main span.fa,#l-fa:checked~main a.plain.fa{display:inline}#l-fa:checked~main div.fa,#l-fa:checked~main p.fa,#l-fa:checked~main ol.fa,#l-fa:checked~main ul.fa,#l-fa:checked~main h1.fa,#l-fa:checked~main h2.fa,#l-fa:checked~main form.fa,#l-fa:checked~main a.btn.fa{display:block}#l-en:checked~main nav label[for=l-en],#l-fa:checked~main nav label[for=l-fa]{background:#e3eefc;font-weight:bold}"
+  + "pre{background:#f0f2f5;padding:8px;border-radius:8px;overflow-x:auto;font-size:11px}table{width:100%;border-collapse:collapse;font-size:13px}th,td{padding:5px 8px;border-bottom:1px solid #e5e7eb;text-align:start;vertical-align:top}th{font-weight:600;white-space:nowrap}.ok{color:#177245;font-weight:600}.bad{color:#b33;font-weight:600}a.plain{color:#2a6fd6}";
+
+const CARRIER_FA = {
+  "websocket-lanes": "چندکاناله (WS Lanes)",
+  websocket: "تک‌کاناله (WS Mux)",
+  https: "HTTPS واقعی (DO)"
+};
+const SPEED_FA = {
+  fast: "پرسرعت",
+  balanced: "متعادل",
+  "low-upload": "آپلود محدود"
+};
+const DC_FA = {
+  normal: "عادی",
+  tolerant: "صبورتر"
+};
+const PROFILE_SHORT_FA = {
+  fast: "پرسرعت",
+  "mobile-mux": "موبایل تک‌کاناله",
+  "mobile-lanes": "موبایل چندکاناله",
+  "https-do": "HTTPS واقعی"
+};
+const PROFILE_SHORT_EN = {
+  fast: "Fast",
+  "mobile-mux": "Mobile Mux",
+  "mobile-lanes": "Mobile Lanes",
+  "https-do": "HTTPS"
+};
 
 // Inline text in both languages; CSS shows one of them (no JavaScript needed).
 function bi(en, fa) {
@@ -1340,7 +1954,7 @@ function bi(en, fa) {
 function bilingualPage(title, lang, body, seal) {
   const fa = lang === "fa";
   const credit = `<footer class="credit">ProxyGosha &middot; ${escapeHtml(seal.name)} &middot; <a href="mailto:${escapeHtml(seal.mail)}">${escapeHtml(seal.mail)}</a></footer>`;
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex"><title>${title}</title><style>${PAGE_STYLE}</style></head><body>
+  return `<!doctype html><html lang="${fa ? "fa" : "en"}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex"><title>${title}</title><style>${PAGE_STYLE}</style></head><body>
 <input type="radio" name="l" id="l-en" hidden${fa ? "" : " checked"}><input type="radio" name="l" id="l-fa" hidden${fa ? " checked" : ""}>
 <main><nav class="lang"><label for="l-en">English</label> <label for="l-fa">فارسی</label></nav>
 ${body}
@@ -1348,58 +1962,411 @@ ${credit}
 </main></body></html>`;
 }
 
-async function servePanel(cfg, host, port, lang) {
+function carrierWarningCard(cfg) {
+  if (!cfg.carrierWarning) return "";
+  if (cfg.carrierWarning === "https_no_do") {
+    return `<div class="card warn"><b>${bi("CARRIER=https is NOT active", "حالت CARRIER=https فعال نیست")}</b> — ${bi(
+      "Stateless Cloudflare Workers cannot hold outbound TCP sockets across separate HTTP long-poll requests. Because the optional SQLite Durable Object binding (<code>PROXY_DO</code>) is not attached, this Worker fell back to <code>" + escapeHtml(cfg.carrier) + "</code>. It is NOT serving HTTPS long-polling.",
+      "ورکر بدون حالت (Stateless) کلودفلر نمی‌تواند سوکت TCP خروجی را بین درخواست‌های جداگانه HTTPS long-polling نگه دارد. چون بایندینگ اختیاری Durable Object با نام <code>PROXY_DO</code> متصل نشده، ورکر روی <code>" + escapeHtml(cfg.carrier) + "</code> اجرا می‌شود و حالت HTTPS واقعی فعال نیست."
+    )}</div>`;
+  }
+  if (cfg.carrierWarning === "https_lanes_to_https" || cfg.carrierWarning === "https_lanes_no_do") {
+    return `<div class="card warn"><b>${bi("CARRIER=https-lanes is not supported", "حالت CARRIER=https-lanes پشتیبانی نمی‌شود")}</b> — ${bi(
+      "Parallel HTTPS long-poll lanes multiply Cloudflare Free daily request consumption. Active carrier is <code>" + escapeHtml(cfg.carrier) + "</code>.",
+      "اجرای هم‌زمان چند کانال HTTPS long-polling سهمیه روزانه درخواست‌های پلن رایگان کلودفلر را به سرعت مصرف می‌کند. حامل فعال فعلی: <code>" + escapeHtml(cfg.carrier) + "</code>."
+    )}</div>`;
+  }
+  return `<div class="card warn"><b>${bi("Unrecognized CARRIER value", "مقدار CARRIER نامعتبر است")}</b> — ${bi(
+    "Requested <code>" + escapeHtml(cfg.carrierRequested) + "</code> is unsupported; active carrier fell back to <code>" + escapeHtml(cfg.carrier) + "</code>.",
+    "مقدار درخواستی <code>" + escapeHtml(cfg.carrierRequested) + "</code> پشتیبانی نمی‌شود؛ حامل فعال به <code>" + escapeHtml(cfg.carrier) + "</code> برگشت."
+  )}</div>`;
+}
+
+function collectPanelHosts(cfg, currentHost) {
+  const list = [];
+  const add = (h, source) => {
+    const clean = String(h || "").trim().toLowerCase();
+    if (!clean || clean === "*" || clean === "proxy.example.com") return;
+    if (!/^[a-z0-9.-]+$/.test(clean) || clean.includes("..")) return;
+    if (list.some((item) => item.host === clean)) return;
+    list.push({ host: clean, source });
+  };
+  add(currentHost, "current");
+  for (const h of cfg.extraHosts || []) add(h, "extra");
+  for (const h of cfg.hosts || []) add(h, "hostname");
+  return list;
+}
+
+async function handleSaveSettings(request, env, cfg, host, url) {
+  const redirectBack = (code, lang) => {
+    const q = new URLSearchParams({ saved: code });
+    if (lang === "fa") q.set("lang", "fa");
+    return new Response(null, {
+      status: 303,
+      headers: {
+        Location: "/" + encodeURIComponent(cfg.adminKey) + "?" + q.toString(),
+        "Cache-Control": "no-store",
+        "Referrer-Policy": "no-referrer"
+      }
+    });
+  };
+  const secFetchSite = (request.headers.get("sec-fetch-site") || "").trim().toLowerCase();
+  if (secFetchSite === "cross-site") {
+    return notFound();
+  }
+  const rawOrigin = (request.headers.get("origin") || "").trim().toLowerCase();
+  // Note: some browsers / privacy extensions send "Origin: null" on same-origin form POSTs
+  // (especially under strict referrer policies). Rely on HMAC _csrf + Sec-Fetch-Site in that case.
+  if (rawOrigin && rawOrigin !== "null" && rawOrigin !== url.origin.toLowerCase() && rawOrigin !== "https://" + host) {
+    return notFound();
+  }
+  let form;
+  try {
+    const text = await request.text();
+    if (text.length > 4096) return notFound();
+    form = new URLSearchParams(text);
+  } catch (_) {
+    return notFound();
+  }
+  const lang = form.get("lang") === "fa" ? "fa" : "en";
+  const csrf = (form.get("_csrf") || "").trim();
+  const validCsrf = csrf ? await verifyToken(cfg, csrf, TOKEN_KIND_CSRF) : null;
+  if (!validCsrf) return redirectBack("csrf", lang);
+
+  if (!cfg.hasKvBinding || !env?.SETTINGS_KV) {
+    return redirectBack("no_kv", lang);
+  }
+
+  const action = (form.get("action") || "save").trim();
+  if (action === "reset") {
+    try {
+      if (typeof env.SETTINGS_KV.delete === "function") await env.SETTINGS_KV.delete(KV_SETTINGS_KEY);
+      else await env.SETTINGS_KV.put(KV_SETTINGS_KEY, "");
+    } catch (_) {
+      return redirectBack("err", lang);
+    }
+    kvSettingsCache = null;
+    kvSettingsCachedAt = Date.now();
+    kvSettingsCachedNs = env.SETTINGS_KV;
+    cachedRuntime = null;
+    cachedKey = null;
+    logEvent("settings_reset", "kv override cleared");
+    return redirectBack("reset", lang);
+  }
+
+  const preset = (form.get("preset") || "").trim().toLowerCase();
+  let carrier = (form.get("carrier") || "").trim().toLowerCase();
+  let wsAutoFallback = form.get("ws_auto_fallback") !== "false";
+  let speedProfile = (form.get("speed_profile") || "").trim().toLowerCase();
+  let dcProfile = (form.get("dc_profile") || "").trim().toLowerCase();
+
+  // Quick preset buttons override individual selects cleanly
+  if (preset === "fast") {
+    carrier = "websocket-lanes"; wsAutoFallback = true; speedProfile = "fast"; dcProfile = "normal";
+  } else if (preset === "balanced") {
+    carrier = "websocket-lanes"; wsAutoFallback = true; speedProfile = "balanced"; dcProfile = "normal";
+  } else if (preset === "mobile-mux") {
+    carrier = "websocket"; wsAutoFallback = false; speedProfile = "low-upload"; dcProfile = "tolerant";
+  } else if (preset === "mobile-lanes") {
+    carrier = "websocket-lanes"; wsAutoFallback = true; speedProfile = "low-upload"; dcProfile = "tolerant";
+  } else if (preset === "https-do") {
+    carrier = "https"; wsAutoFallback = false; speedProfile = "balanced"; dcProfile = "tolerant";
+  }
+
+  if (carrier !== "websocket-lanes" && carrier !== "websocket" && carrier !== "https") {
+    return redirectBack("invalid", lang);
+  }
+  if (carrier === "https" && !cfg.hasDoBinding) {
+    return redirectBack("no_do", lang);
+  }
+  if (!Object.prototype.hasOwnProperty.call(SPEED_PRESETS, speedProfile)) speedProfile = "balanced";
+  if (!Object.prototype.hasOwnProperty.call(DC_PRESETS, dcProfile)) dcProfile = "normal";
+
+  const nextSettings = {
+    carrier,
+    wsAutoFallback,
+    speedProfile,
+    dcProfile,
+    updatedAt: Date.now()
+  };
+  try {
+    await env.SETTINGS_KV.put(KV_SETTINGS_KEY, JSON.stringify(nextSettings));
+  } catch (_) {
+    return redirectBack("err", lang);
+  }
+  kvSettingsCache = nextSettings;
+  kvSettingsCachedAt = Date.now();
+  kvSettingsCachedNs = env.SETTINGS_KV;
+  cachedRuntime = null;
+  cachedKey = null;
+  logEvent("settings_saved", `carrier=${carrier} speed=${speedProfile} dc=${dcProfile} fb=${wsAutoFallback ? 1 : 0}`);
+  return redirectBack("1", lang);
+}
+
+async function servePanel(cfg, host, port, lang, savedState = "") {
   STATS.panelViews++;
-  logEvent("panel_view", host);
+  logEvent("panel_view", host, [cfg.adminKey, cfg.secretHex]);
   const statusHref = "/" + encodeURIComponent(cfg.adminKey) + "/status";
+  const settingsAction = "/" + encodeURIComponent(cfg.adminKey) + "/settings";
+  const csrfToken = await issueToken(cfg, TOKEN_KIND_CSRF, 7200, 0);
   const secret = "dd" + bytesToHex(cfg.base);
-  const hosts = [];
-  for (const h of [host, ...(cfg.extraHosts || [])]) if (h && !hosts.includes(h)) hosts.push(h);
-  const sections = hosts.map((h) => {
+  const hostEntries = collectPanelHosts(cfg, host);
+  const nonStandardPorts = HTTPS_PORTS.filter((p) => p !== 443);
+
+  let savedBanner = "";
+  if (savedState === "1") {
+    savedBanner = `<div class="card okbox"><b>${bi("Global settings saved &amp; active", "تنظیمات سراسری ذخیره و فعال شد")}</b> — ${bi(
+      "Saved in <code>SETTINGS_KV</code> and active globally across Cloudflare isolates for the Primary (Default) link. Toggle the proxy off and on once in Telegram to start a fresh session with the new mode.",
+      "در <code>SETTINGS_KV</code> ذخیره شد و به‌صورت سراسری روی کل کلودفلر برای لینک اصلی (پیش‌فرض) اعمال می‌شود. در تلگرام یک‌بار پروکسی را قطع و وصل کنید تا نشست جدید با تنظیمات تازه ساخته شود."
+    )}</div>`;
+  } else if (savedState === "reset") {
+    savedBanner = `<div class="card okbox"><b>${bi("Settings reset to defaults", "تنظیمات به حالت پیش‌فرض برگشت")}</b> — ${bi(
+      "Global panel override cleared from <code>SETTINGS_KV</code>; environment variables / defaults are now active.",
+      "تنظیمات ذخیره شده از <code>SETTINGS_KV</code> پاک شد و مقادیر پیش‌فرض / متغیرهای محیطی فعال شدند."
+    )}</div>`;
+  } else if (savedState === "no_do") {
+    savedBanner = `<div class="card warn"><b>${bi("Cannot enable HTTPS carrier without PROXY_DO", "بدون PROXY_DO امکان فعال‌سازی HTTPS نیست")}</b> — ${bi(
+      "Attach the optional SQLite Durable Object binding <code>PROXY_DO</code> first to enable true HTTPS long-polling.",
+      "برای فعال‌سازی HTTPS long-polling واقعی، ابتدا باید بایندینگ اختیاری <code>PROXY_DO</code> را متصل کنید."
+    )}</div>`;
+  } else if (savedState === "no_kv") {
+    savedBanner = `<div class="card warn"><b>${bi("SETTINGS_KV is not bound", "بایندینگ SETTINGS_KV متصل نیست")}</b> — ${bi(
+      "To change the Default link globally from the panel, bind a free KV namespace as <code>SETTINGS_KV</code>. Meanwhile, the Per-Operator profile links below already work globally with zero bindings!",
+      "برای ذخیرهٔ سراسری تنظیمات لینک پیش‌فرض از داخل پنل، یک فضای KV رایگان با نام <code>SETTINGS_KV</code> متصل کنید. لینک‌های اختصاصی هر اپراتور در پایین همین الان بدون نیاز به KV به‌صورت سراسری کار می‌کنند!"
+    )}</div>`;
+  } else if (savedState === "csrf" || savedState === "invalid" || savedState === "err") {
+    savedBanner = `<div class="card warn">${bi(
+      "Could not save settings (expired form token or storage error). Reload this page and try again.",
+      "ذخیره تنظیمات انجام نشد (توکن فرم منقضی شده یا خطای ذخیره‌سازی رخ داده). صفحه را رفرش کنید و دوباره امتحان کنید."
+    )}</div>`;
+  }
+
+  const kvBadge = cfg.hasKvBinding
+    ? `<span class="badge badge-ok">${bi("SETTINGS_KV active — live global save", "SETTINGS_KV متصل — ذخیره سراسری فعال")}</span>`
+    : `<span class="badge badge-warn">${bi("No KV binding — use Per-Operator links below or attach free SETTINGS_KV", "بدون KV — از لینک‌های هر اپراتور در پایین استفاده کنید یا SETTINGS_KV رایگان وصل کنید")}</span>`;
+
+  const sel = (cur, val) => cur === val ? " selected" : "";
+  const dis = cfg.hasKvBinding ? "" : " disabled";
+  const settingsFormEn = `<form class="en" method="POST" action="${escapeHtml(settingsAction)}">
+<input type="hidden" name="_csrf" value="${escapeHtml(csrfToken)}">
+<input type="hidden" name="lang" value="en">
+<div class="fgrid">
+  <div class="ffield">
+    <label for="f-carrier-en">Transport carrier</label>
+    <select id="f-carrier-en" name="carrier"${dis}>
+      <option value="websocket-lanes"${sel(cfg.carrier, "websocket-lanes")}>websocket-lanes (multi-lane WS, default)</option>
+      <option value="websocket"${sel(cfg.carrier, "websocket")}>websocket (single mux WS — best if ISP drops parallel WS)</option>
+      <option value="https"${sel(cfg.carrier, "https")}${cfg.hasDoBinding ? "" : " disabled"}>https (${cfg.hasDoBinding ? "true HTTPS long-poll via PROXY_DO" : "disabled — bind PROXY_DO first"})</option>
+    </select>
+  </div>
+  <div class="ffield">
+    <label for="f-speed-en">Upload &amp; throughput pacing</label>
+    <select id="f-speed-en" name="speed_profile"${dis}>
+      <option value="fast"${sel(cfg.speedProfile, "fast")}>fast (unrestricted ISP / FTTH — 512 KiB / 1 MiB batches)</option>
+      <option value="balanced"${sel(cfg.speedProfile, "balanced")}>balanced (general purpose — 64 KiB / 128 KiB batches)</option>
+      <option value="low-upload"${sel(cfg.speedProfile, "low-upload")}>low-upload (throttled mobile / Irancell — 32 KiB / 64 KiB, 4 retries, 75s)</option>
+    </select>
+  </div>
+  <div class="ffield">
+    <label for="f-fb-en">WS lanes → single WS auto-fallback</label>
+    <select id="f-fb-en" name="ws_auto_fallback"${dis}>
+      <option value="true"${cfg.wsAutoFallback ? " selected" : ""}>Enabled (recommended)</option>
+      <option value="false"${!cfg.wsAutoFallback ? " selected" : ""}>Disabled</option>
+    </select>
+  </div>
+  <div class="ffield">
+    <label for="f-dc-en">Telegram DC connect timeouts</label>
+    <select id="f-dc-en" name="dc_profile"${dis}>
+      <option value="normal"${sel(cfg.dcProfile, "normal")}>normal (2.2s / 7.5s)</option>
+      <option value="tolerant"${sel(cfg.dcProfile, "tolerant")}>tolerant (3.0s / 9.5s)</option>
+    </select>
+  </div>
+</div>
+<div class="factions">
+  <button class="btn" type="submit" name="action" value="save"${dis}>Save &amp; Apply Globally</button>
+  <button class="btn btn-sec" type="submit" name="preset" value="fast"${dis}>Quick: Unrestricted / Fast</button>
+  <button class="btn btn-sec" type="submit" name="preset" value="mobile-mux"${dis}>Quick: Irancell / Mobile Mux</button>
+  <button class="btn btn-sec" type="submit" name="action" value="reset"${dis}>Reset to Defaults</button>
+</div>
+</form>`;
+
+  const settingsFormFa = `<form class="fa" method="POST" action="${escapeHtml(settingsAction)}">
+<input type="hidden" name="_csrf" value="${escapeHtml(csrfToken)}">
+<input type="hidden" name="lang" value="fa">
+<div class="fgrid">
+  <div class="ffield">
+    <label for="f-carrier-fa">حالت انتقال (Carrier)</label>
+    <select id="f-carrier-fa" name="carrier"${dis}>
+      <option value="websocket-lanes"${sel(cfg.carrier, "websocket-lanes")}>چندکاناله (websocket-lanes — پیش‌فرض)</option>
+      <option value="websocket"${sel(cfg.carrier, "websocket")}>تک‌کاناله مالتی‌پلکس (websocket — مناسب محدودیت WS ایرانسل)</option>
+      <option value="https"${sel(cfg.carrier, "https")}${cfg.hasDoBinding ? "" : " disabled"}>${cfg.hasDoBinding ? "HTTPS واقعی (با PROXY_DO)" : "HTTPS واقعی (غیرفعال — نیازمند اتصال PROXY_DO)"}</option>
+    </select>
+  </div>
+  <div class="ffield">
+    <label for="f-speed-fa">حالت سرعت و بسته‌بندی آپلود</label>
+    <select id="f-speed-fa" name="speed_profile"${dis}>
+      <option value="fast"${sel(cfg.speedProfile, "fast")}>پرسرعت (اپراتور آزاد و اینترنت ثابت — بسته‌های ۵۱۲K / ۱M)</option>
+      <option value="balanced"${sel(cfg.speedProfile, "balanced")}>متعادل (پیش‌فرض — بسته‌های ۶۴K / ۱۲۸K)</option>
+      <option value="low-upload"${sel(cfg.speedProfile, "low-upload")}>آپلود محدود (ایرانسل / موبایل ضعیف — بسته‌های ۳۲K / ۶۴K، ۴ تلاش، ۷۵ ثانیه)</option>
+    </select>
+  </div>
+  <div class="ffield">
+    <label for="f-fb-fa">تبدیل خودکار چندکاناله به تک‌کاناله</label>
+    <select id="f-fb-fa" name="ws_auto_fallback"${dis}>
+      <option value="true"${cfg.wsAutoFallback ? " selected" : ""}>فعال (پیشنهادی)</option>
+      <option value="false"${!cfg.wsAutoFallback ? " selected" : ""}>غیرفعال</option>
+    </select>
+  </div>
+  <div class="ffield">
+    <label for="f-dc-fa">تایم‌اوت اتصال به دیتاسنتر تلگرام</label>
+    <select id="f-dc-fa" name="dc_profile"${dis}>
+      <option value="normal"${sel(cfg.dcProfile, "normal")}>عادی (۲.۲ ثانیه / حداکثر ۷.۵ ثانیه)</option>
+      <option value="tolerant"${sel(cfg.dcProfile, "tolerant")}>صبورتر (۳ ثانیه / حداکثر ۹.۵ ثانیه)</option>
+    </select>
+  </div>
+</div>
+<div class="factions">
+  <button class="btn" type="submit" name="action" value="save"${dis}>ذخیره و اعمال سراسری</button>
+  <button class="btn btn-sec" type="submit" name="preset" value="fast"${dis}>حالت سریع: اپراتور آزاد / پرسرعت</button>
+  <button class="btn btn-sec" type="submit" name="preset" value="mobile-mux"${dis}>حالت سریع: ایرانسل / موبایل تک‌کاناله</button>
+  <button class="btn btn-sec" type="submit" name="action" value="reset"${dis}>بازگشت به پیش‌فرض</button>
+</div>
+</form>`;
+
+  const settingsCard = `<div class="card"><b>${bi("Network &amp; Operator Settings (controls the Primary Default link)", "تنظیمات شبکه و اپراتور (تغییر رفتار لینک اصلی پیش‌فرض)")}</b>${kvBadge}
+<p class="muted">${bi(
+    "Different ISPs have different restrictions (e.g., fixed broadband handles large multi-lane bursts cleanly, while mobile carriers like Irancell may throttle upload or disrupt parallel WebSockets). Use either: (1) this global setting (requires free <code>SETTINGS_KV</code>) to update your existing Primary link, OR (2) the ready-to-use <b>Per-Operator Profile links</b> under your domain below which work globally RIGHT NOW with zero bindings!",
+    "اپراتورهای مختلف رفتار متفاوتی دارند (مثلاً اینترنت ثابت یا اپراتورهای آزادتر با بسته‌های بزرگ و چندکاناله سریع‌ترند، اما اپراتورهایی مثل ایرانسل ممکن است آپلود یا WebSocket چندکاناله را محدود کنند). دو راه دارید: ۱) ذخیرهٔ تنظیم سراسری در اینجا (نیازمند <code>SETTINGS_KV</code> رایگان) برای تغییر رفتار لینک اصلیِ قبلی، یا ۲) استفاده از <b>لینک‌های اختصاصی هر اپراتور</b> در بخش زیر که همین الان بدون هیچ بایندینگی روی کل کلودفلر واقعاً کار می‌کنند!"
+  )}</p>
+${settingsFormEn}
+${settingsFormFa}
+${cfg.hasKvBinding ? "" : `<p class="muted" style="margin-top:8px"><b>${bi("How to enable live global saving (100% Free, 30 seconds):", "نحوه فعال‌سازی ذخیره سراسری داخل پنل (کاملاً رایگان، ۳۰ ثانیه):")}</b> ${bi(
+  "Cloudflare Dashboard → Storage &amp; Databases → Workers KV → Create namespace (any name) → open this Worker → Settings → Bindings → Add → KV Namespace → Variable name: <code>SETTINGS_KV</code> → Deploy.",
+  "داشبورد کلودفلر ← Storage &amp; Databases ← Workers KV ← ساخت یک فضای جدید ← باز کردن همین ورکر ← Settings ← Bindings ← Add ← KV Namespace ← نام متغیر: <code>SETTINGS_KV</code> ← Deploy."
+)}</p>`}
+</div>`;
+
+  const sections = hostEntries.map(({ host: h, source }) => {
     const workersDev = h.endsWith(".workers.dev");
-    const items = HTTPS_PORTS.map((p) => {
-      const pSecret = cfg.portSecrets?.[p]?.secretHex || secret;
-      const link = "tg://webproxy?server=" + encodeURIComponent(h) + (p !== 443 ? "&port=" + p : "") + "&secret=" + pSecret;
-      return `<div class="card"><b>${bi("Port", "پورت")} ${p}</b>${p === 443 ? " " + bi("(default)", "(پیش‌فرض)") : ""}<a class="btn" href="${escapeHtml(link)}">${bi("Connect in Telegram", "اتصال در تلگرام")}</a><textarea readonly>${escapeHtml(link)}</textarea></div>`;
-    }).join("");
-    const note = workersDev
+    const p443Secret = cfg.portSecrets?.[443]?.secretHex || secret;
+    const p443Link = "tg://webproxy?server=" + encodeURIComponent(h) + "&secret=" + p443Secret;
+    const badge = source === "current"
+      ? `<span class="badge badge-ok">${bi("current request host", "دامنه همین درخواست")}</span>`
+      : `<span class="badge badge-warn">${bi("listed in " + (source === "extra" ? "EXTRA_HOSTS" : "HOSTNAME") + " — attach in Cloudflare first", "فهرست‌شده در " + (source === "extra" ? "EXTRA_HOSTS" : "HOSTNAME") + " — اتصال در کلودفلر الزامی است")}</span>`;
+
+    const hostNote = workersDev
       ? `<p class="muted">${bi(
-          "workers.dev addresses are often filtered in Iran, and some ports may not open on them. Attach a custom domain to this Worker for the best results.",
-          "آدرس workers.dev معمولاً در ایران فیلتر است و ممکن است بعضی پورت‌ها رویش باز نباشند. بهتر است یک دامنه شخصی (Custom Domain) به ورکر وصل کنید."
+          "workers.dev addresses are widely filtered in Iran and only use standard port 443. Attach one or more Custom Domains to this Worker (Settings → Domains & Routes → Custom Domain) for better reachability.",
+          "آدرس‌های workers.dev معمولاً در ایران فیلتر هستند و فقط روی پورت ۴۴۳ کار می‌کنند. برای پایداری بیشتر، یک یا چند Custom Domain به ورکر متصل کنید (Settings ← Domains & Routes ← Custom Domain)."
         )}</p>`
-      : "";
-    const manualItems = HTTPS_PORTS.map((p) => {
-      const s = cfg.portSecrets?.[p]?.secretHex || secret;
-      return `<div style="margin:6px 0"><b>${bi("Port", "پورت")} ${p}</b>${p === 443 ? " " + bi("(default)", "(پیش‌فرض)") : ""}:<textarea class="one" readonly>${escapeHtml(s)}</textarea></div>`;
-    }).join("");
-    const manual = `<div class="card"><b>${bi("Manual entry", "ورود دستی")}</b> — ${bi(
-        "in Telegram's proxy settings, add a new proxy of type <b>WEB</b>. Each port has its own unique secret:",
-        "در تنظیمات پروکسی تلگرام یک پروکسی جدید از نوع <b>WEB</b> اضافه کنید. هر پورت سکرت اختصاصی خود را دارد:"
-      )}<br>
+      : (source !== "current"
+        ? `<p class="muted">${bi(
+            "Listing a domain in EXTRA_HOSTS or HOSTNAME does NOT attach DNS/TLS to this Worker. Confirm this hostname is attached under Cloudflare Dashboard → Worker → Settings → Domains & Routes → Custom Domain (or Route) and opens this panel directly.",
+            "وارد کردن دامنه در EXTRA_HOSTS یا HOSTNAME به تنهایی آن را به ورکر وصل نمی‌کند. ابتدا دامنه را در داشبورد کلودفلر (Worker ← Settings ← Domains & Routes ← Custom Domain) متصل کنید و باز شدن پنل روی آن را بررسی کنید."
+          )}</p>`
+        : "");
+
+    const defaultModeTagEn = `${escapeHtml(cfg.carrier)} &middot; ${escapeHtml(cfg.speedProfile)} &middot; dc:${escapeHtml(cfg.dcProfile)}`;
+    const defaultModeTagFa = `${escapeHtml(CARRIER_FA[cfg.carrier] || cfg.carrier)} &middot; ${escapeHtml(SPEED_FA[cfg.speedProfile] || cfg.speedProfile)} &middot; تایم‌اوت: ${escapeHtml(DC_FA[cfg.dcProfile] || cfg.dcProfile)}`;
+    const primaryCard = `<div class="card"><b>${bi("Port 443 — Primary Default Link (controlled by Global Settings above)", "پورت ۴۴۳ — لینک اصلی پیش‌فرض (تحت کنترل تنظیمات سراسری بالا)")}</b>
+<span class="badge badge-ok">${bi(defaultModeTagEn, defaultModeTagFa)}</span>
+<a class="btn" href="${escapeHtml(p443Link)}">${bi("Connect in Telegram (Default / Port 443)", "اتصال در تلگرام (پیش‌فرض / پورت ۴۴۳)")}</a>
+<textarea readonly>${escapeHtml(p443Link)}</textarea>
+<div style="margin-top:8px"><b>${bi("Manual entry (WEB proxy)", "ورود دستی (پروکسی WEB)")}</b> <span class="muted">${bi("— official Telegram WEB proxy uses HTTPS port 443 implicitly (no port field):", "— پروکسی WEB رسمی تلگرام همیشه از HTTPS پورت ۴۴۳ استفاده می‌کند و فیلد پورت ندارد:")}</span></div>
 ${bi("Server", "سرور")}:<textarea class="one" readonly>${escapeHtml(h)}</textarea>
-<div style="margin-top:8px"><b>${bi("Ports &amp; Secrets", "پورت‌ها و سکرت‌ها")}:</b></div>
-${manualItems}</div>`;
-    return `<h2>${escapeHtml(h)}</h2>${note}${manual}${items}`;
+${bi("Secret (Primary / Port 443)", "سکرت (اصلی / پورت ۴۴۳)")}:<textarea class="one" readonly>${escapeHtml(p443Secret)}</textarea>
+</div>`;
+
+    const profileCards = OPERATOR_PROFILES.map((prof) => {
+      const entry = cfg.profileSecrets?.[prof.id];
+      const available = !prof.requiresDo || cfg.hasDoBinding;
+      if (!entry || !available) {
+        return `<div class="pbox pbox-dis"><b>${bi(prof.titleEn, prof.titleFa)}</b> <span class="badge badge-warn">${bi("requires optional PROXY_DO", "نیازمند بایندینگ اختیاری PROXY_DO")}</span>
+<p class="muted">${bi(prof.descEn, prof.descFa)}</p></div>`;
+      }
+      const pLink = "tg://webproxy?server=" + encodeURIComponent(h) + "&secret=" + entry.secretHex;
+      const pTagEn = `${escapeHtml(prof.carrier)} &middot; ${escapeHtml(prof.speedProfile)}`;
+      const pTagFa = `${escapeHtml(CARRIER_FA[prof.carrier] || prof.carrier)} &middot; ${escapeHtml(SPEED_FA[prof.speedProfile] || prof.speedProfile)}`;
+      const pNameEn = PROFILE_SHORT_EN[prof.id] || prof.id;
+      const pNameFa = PROFILE_SHORT_FA[prof.id] || prof.id;
+      return `<div class="pbox"><b>${bi(prof.titleEn, prof.titleFa)}</b> <span class="badge badge-ok">${bi(pTagEn, pTagFa)}</span>
+<p class="muted">${bi(prof.descEn, prof.descFa)}</p>
+<a class="btn" href="${escapeHtml(pLink)}">${bi("Connect (" + pNameEn + ")", "اتصال (" + pNameFa + ")")}</a>
+<textarea readonly>${escapeHtml(pLink)}</textarea>
+<div class="muted">${bi("Profile secret (" + pNameEn + "):", "سکرت اختصاصی (" + pNameFa + "):")}</div>
+<textarea class="one" readonly>${escapeHtml(entry.secretHex)}</textarea></div>`;
+    }).join("");
+
+    const profilesCard = `<div class="card"><b>${bi("Instant Per-Operator Profile Links (work globally with ZERO bindings)", "لینک‌های آمادهٔ تفکیک‌شده برای هر اپراتور (فعالِ فوری و سراسری، بدون نیاز به KV)")}</b>
+<p class="muted">${bi(
+      "Each link below cryptographically selects its own transport mode and batch sizing inside the Worker — so one user on fixed broadband (Fast) and another on Irancell (Mobile Mux) can connect to the exact same Worker simultaneously without changing global settings!",
+      "هر لینک زیر به‌صورت رمزنگاری‌شده حالت انتقال و اندازهٔ بسته‌های خودش را در Worker فعال می‌کند؛ بنابراین می‌توانید هم‌زمان روی اینترنت ثابت از لینک پرسرعت و روی ایرانسل از لینک موبایل تک‌کاناله روی همین یک ورکر استفاده کنید و داخل تلگرام با یک لمس بین آن‌ها جابه‌جا شوید!"
+    )}</p>
+${profileCards}</div>`;
+
+    const compatItems = nonStandardPorts.map((p) => {
+      const pSecret = cfg.portSecrets?.[p]?.secretHex || secret;
+      const link = "tg://webproxy?server=" + encodeURIComponent(h) + "&port=" + p + "&secret=" + pSecret;
+      return `<div style="margin:10px 0;padding-top:8px;border-top:1px solid #eceef2"><b>${bi("Port", "پورت")} ${p}</b>
+<a class="btn" href="${escapeHtml(link)}">${bi("Connect (Port " + p + ")", "اتصال (پورت " + p + ")")}</a>
+<textarea readonly>${escapeHtml(link)}</textarea>
+<div class="muted">${bi("Port " + p + " secret:", "سکرت پورت " + p + ":")}</div>
+<textarea class="one" readonly>${escapeHtml(pSecret)}</textarea></div>`;
+    }).join("");
+
+    const compatBlock = `<details class="compat"><summary>${bi("Non-standard Cloudflare HTTPS ports (2053, 2083, 2087, 2096, 8443) — compatibility only", "پورت‌های غیراستاندارد HTTPS کلودفلر (2053، 2083، 2087، 2096، 8443) — فقط برای سازگاری")}</summary>
+<p class="muted">${bi(
+      "Cloudflare Custom Domains accept HTTPS on 443, 2053, 2083, 2087, 2096, and 8443. However, official Telegram Desktop and reference WEB Proxy clients currently fix HTTPS to port 443 and ignore &amp;port=. These links and deterministic per-port secrets are preserved for backward compatibility and custom/third-party clients; on official Telegram, attaching multiple Custom Domains is the reliable failover instead of switching ports.",
+      "دامنه‌های شخصی کلودفلر روی پورت‌های 443، 2053، 2083، 2087، 2096 و 8443 ترافیک HTTPS می‌پذیرند؛ اما کلاینت رسمی Telegram Desktop و مشخصات مرجع WEB Proxy در حال حاضر فقط از پورت 443 استفاده می‌کنند و پارامتر &amp;port= را نادیده می‌گیرند. این لینک‌ها و سکرت‌های اختصاصی صرفاً برای سازگاری با لینک‌های قبلی یا کلاینت‌های سفارشی حفظ شده‌اند؛ در تلگرام رسمی، استفاده از چند Custom Domain جایگزین مؤثرتر از تغییر پورت است."
+    )}</p>${compatItems}</details>`;
+
+    return `<h2>${escapeHtml(h)}${badge}</h2>${hostNote}${primaryCard}${profilesCard}${compatBlock}`;
   }).join("");
+
   const derivedNote = cfg.secretDerived
     ? `<div class="card warn">${bi(
-        "Your proxy secrets are derived from ADMIN_KEY. Changing ADMIN_KEY changes the secrets and breaks every link you have shared. To avoid this, also set a fixed SECRET variable.",
-        "سکرت‌های پروکسی از ADMIN_KEY ساخته شده‌اند. اگر ADMIN_KEY را عوض کنید، سکرت‌ها هم عوض می‌شوند و همه لینک‌هایی که فرستاده‌اید از کار می‌افتند. برای جلوگیری، یک متغیر SECRET ثابت هم تنظیم کنید."
+        "Your proxy secrets are derived from ADMIN_KEY. Changing ADMIN_KEY changes the secrets and breaks every link you have shared. To rotate ADMIN_KEY safely, set a fixed SECRET variable first.",
+        "سکرت‌های پروکسی از ADMIN_KEY ساخته شده‌اند. اگر ADMIN_KEY را عوض کنید، سکرت‌ها هم عوض می‌شوند و همه لینک‌هایی که فرستاده‌اید از کار می‌افتند. برای جلوگیری، ابتدا یک متغیر SECRET ثابت تنظیم کنید."
       )}</div>`
     : "";
+
+  const httpsDoNote = cfg.carrier === "https"
+    ? `<div class="card info">${bi(
+        "Active carrier: <code>https</code> (serialized HTTPS long-polling via optional <code>PROXY_DO</code> Durable Object). Watch Cloudflare Free daily Durable Object quotas (100,000 requests/day and 13,000 GB-s/day).",
+        "حامل فعال: <code>https</code> (HTTPS long-polling واقعی از طریق بایندینگ اختیاری <code>PROXY_DO</code>). به سهمیه روزانه رایگان Durable Objects کلودفلر (۱۰۰٬۰۰۰ درخواست و ۱۳٬۰۰۰ GB-s در روز) توجه کنید."
+      )}</div>`
+    : "";
+
+  const compatNotice = `<div class="card info"><b>${bi("Client, domain &amp; network honesty notice", "نکات مهم سازگاری کلاینت، دامنه و شبکه")}</b>
+<ul class="en">
+<li><b>Port 443 vs Cloudflare ports:</b> Official Telegram WEB Proxy clients connect strictly on HTTPS port <code>443</code> and ignore <code>&amp;port=</code>. Legacy non-443 secrets below are preserved for compatibility only — they do not switch ports in official Telegram.</li>
+<li><b>Backup domains &amp; failover:</b> The bridge runs strictly same-origin, so cross-domain failover is done manually by adding multiple <code>tg://webproxy</code> links (each on a domain you own and attached in Cloudflare) in Telegram Proxy Settings. Listing a host in <code>EXTRA_HOSTS</code> does NOT create DNS, attach the domain, or issue TLS certificates.</li>
+<li><b>Real-store / .ir subdomains:</b> Before moving DNS for a live store domain to Cloudflare, check its website, Iranian payment gateways, and email (MX/SPF/DKIM). Keep the main store DNS-only if needed and attach only a dedicated subdomain with the owner's permission. A storefront decoy does not by itself defeat traffic-pattern, SNI, or WebSocket filtering.</li>
+<li><b>Operator profiles vs global settings:</b> Per-Operator links work immediately across all isolates without storage; binding free <code>SETTINGS_KV</code> lets you change the default link globally from this panel without redistributing links.</li>
+<li><b>Client support &amp; shutdowns:</b> Telegram Desktop supports WEB proxy natively; mobile support depends on the installed build. If your ISP completely blocks Cloudflare or international internet access, Worker changes alone cannot establish the first connection.</li>
+</ul>
+<ul class="fa">
+<li><b>پورت ۴۴۳ در برابر پورت‌های کلودفلر:</b> کلاینت‌های رسمی WEB Proxy تلگرام فقط روی HTTPS پورت <code>443</code> وصل می‌شوند و پارامتر <code>&amp;port=</code> را نادیده می‌گیرند. لینک‌ها و سکرت‌های غیر ۴۴۳ فقط برای سازگاری حفظ شده‌اند و در تلگرام رسمی پورت را تغییر نمی‌دهند.</li>
+<li><b>دامنه‌های پشتیبان و failover:</b> صفحه bridge صرفاً same-origin است؛ بنابراین جایگزینی بین چند دامنه به‌صورت دستی با افزودن چند لینک <code>tg://webproxy</code> در تنظیمات پروکسی تلگرام انجام می‌شود. نوشتن دامنه در <code>EXTRA_HOSTS</code> به هیچ وجه DNS، اتصال دامنه یا گواهی TLS ایجاد نمی‌کند.</li>
+<li><b>ساب‌دامین دامنه فروشگاهی / .ir:</b> پیش از تغییر DNS دامنه یک فروشگاه واقعی، حتماً سایت اصلی، درگاه پرداخت و ایمیل (MX/SPF/DKIM) آن را بررسی کنید و فقط با اجازه مالک اقدام کنید. ظاهر فروشگاهی به‌تنهایی مانع شناسایی الگوی ترافیک، SNI یا اختلال WebSocket نمی‌شود.</li>
+<li><b>لینک‌های هر اپراتور در برابر تنظیم سراسری:</b> لینک‌های اختصاصی هر اپراتور بدون نیاز به KV همین لحظه روی کل کلودفلر کار می‌کنند؛ با اتصال <code>SETTINGS_KV</code> رایگان می‌توانید رفتار لینک اصلی قبلی را هم از همین پنل سراسری تغییر دهید.</li>
+<li><b>سازگاری و قطعی کامل:</b> Telegram Desktop پشتیبانی بومی دارد اما پشتیبانی موبایل وابسته به نسخه نصب‌شده است. در صورت مسدودسازی کامل کلودفلر یا قطع کامل اینترنت بین‌الملل، تغییر کد ورکر به تنهایی اتصال اولیه را برقرار نمی‌کند.</li>
+</ul></div>`;
+
   const body = `<h1>${bi("Proxy panel", "پنل پروکسی")}</h1>
-<div class="card">${bi(
-    "Tap <b>Connect in Telegram</b> to add the proxy. Each port has its own secret. If a port does not connect, try another one. You can add several ports at once and switch between them in Telegram.",
-    "روی «اتصال در تلگرام» بزنید تا پروکسی اضافه شود. هر پورت سکرت اختصاصی خود را دارد. اگر یک پورت وصل نشد، پورت دیگری را امتحان کنید. می‌توانید چند پورت را با هم اضافه کنید و در تلگرام بینشان جابه‌جا شوید."
-  )}</div>
 <div class="card warn">${bi(
-    "Do not share this page. Share only the links, or the server, port and matching secret.",
-    "این صفحه را با کسی به اشتراک نگذارید. فقط لینک‌ها یا سرور، پورت و سکرت مربوطه را بفرستید."
+    "Do not share this panel URL (it contains your ADMIN_KEY). Share only the tg://webproxy links or server + secret.",
+    "آدرس این پنل را با کسی به اشتراک نگذارید (حاوی ADMIN_KEY است). فقط لینک‌های tg://webproxy یا سرور و سکرت را بفرستید."
   )}</div>
-<div class="card"><a class="plain" href="${escapeHtml(statusHref)}">${bi("Status &amp; logs", "وضعیت و لاگ‌ها")}</a> <span class="muted">${bi("— live statistics, recent events and a Telegram DC reachability probe.", "— آمار زنده، رویدادهای اخیر و تست دسترسی به دیتاسنترهای تلگرام.")}</span></div>
+<div class="card"><a class="plain en" href="${escapeHtml(statusHref)}">Status &amp; 5-stage diagnostics</a><a class="plain fa" href="${escapeHtml(statusHref + "?lang=fa")}">وضعیت و تشخیص خطای ۵ مرحله‌ای</a> <span class="muted">${bi("— stage-by-stage counters, sanitized events, and Cloudflare→Telegram DC probe.", "— شمارنده‌های مرحله‌به‌مرحله، رویدادهای پاک‌سازی‌شده و تست دسترسی کلودفلر به دیتاسنترهای تلگرام.")}</span></div>
+${savedBanner}
+${carrierWarningCard(cfg)}
+${httpsDoNote}
 ${derivedNote}
-${sections}`;
-  return new Response(bilingualPage("Panel", lang, body, await unseal()), { status: 200, headers: pageHeaders() });
+${settingsCard}
+${sections}
+${compatNotice}`;
+  return new Response(bilingualPage(lang === "fa" ? "پنل پروکسی" : "Proxy Panel", lang, body, await unseal()), { status: 200, headers: pageHeaders(true) });
 }
 
 async function serveSetup(host, env, lang, method) {
@@ -1420,10 +2387,12 @@ async function serveSetup(host, env, lang, method) {
 <ol class="en"><li>In the Cloudflare dashboard, open <b>Workers &amp; Pages</b> → this Worker → <b>Settings</b> → <b>Variables and Secrets</b>.</li>
 <li>Click <b>Add</b>. Name: <code>ADMIN_KEY</code>. Value: the key below (or any password of 16+ English letters and digits).</li>
 <li>Click <b>Deploy</b>.</li>
+<li>Attach a Custom Domain under <b>Settings → Domains &amp; Routes → Custom Domain</b> (recommended in Iran since <code>workers.dev</code> is commonly filtered).</li>
 <li>Open the address below to reach your panel with ready Telegram links.</li></ol>
 <ol class="fa"><li>در داشبورد کلودفلر: <b>Workers &amp; Pages</b> ← این ورکر ← <b>Settings</b> ← <b>Variables and Secrets</b></li>
 <li>روی <b>Add</b> بزنید. نام: <code>ADMIN_KEY</code> ، مقدار: رمز زیر (یا هر رمز ۱۶+ حرفی از حروف و اعداد انگلیسی)</li>
 <li><b>Deploy</b> را بزنید.</li>
+<li>یک دامنه شخصی در بخش <b>Settings ← Domains &amp; Routes ← Custom Domain</b> متصل کنید (در ایران به دلیل فیلتر بودن <code>workers.dev</code> قویاً توصیه می‌شود).</li>
 <li>آدرس زیر را باز کنید تا پنل و لینک‌های آماده تلگرام را ببینید.</li></ol>
 ${bi("Suggested key", "رمز پیشنهادی")}:<textarea class="one" readonly>${escapeHtml(suggested)}</textarea>
 ${bi("Panel address", "آدرس پنل")}:<textarea class="one" readonly>https://${escapeHtml(host)}/${escapeHtml(suggested)}</textarea></div>
@@ -1431,7 +2400,7 @@ ${bi("Panel address", "آدرس پنل")}:<textarea class="one" readonly>https:/
     "Keep this key private. Anyone who has it can open your panel. If you reload this page, a new key is suggested; use the one you actually saved in Cloudflare.",
     "این رمز را جایی امن نگه دارید. هر کس آن را داشته باشد به پنل دسترسی دارد. با رفرش صفحه رمز جدیدی پیشنهاد می‌شود؛ همان رمزی را استفاده کنید که در کلودفلر ذخیره کرده‌اید."
   )}</p>`;
-  return new Response(bilingualPage("Setup", lang, body, await unseal()), { status: 200, headers: pageHeaders() });
+  return new Response(bilingualPage(lang === "fa" ? "راه‌اندازی پروکسی" : "Proxy Setup", lang, body, await unseal()), { status: 200, headers: pageHeaders() });
 }
 
 function fmtBytes(value) {
@@ -1452,75 +2421,176 @@ function fmtDuration(milliseconds) {
   return minutes + "m " + (total % 60) + "s";
 }
 
-// On-demand reachability probe of the Telegram DC front-ends used by this
-// worker. Admin-only, runs only when explicitly requested (?probe=1), keeps
-// at most three TCP sockets in the "connecting" phase and closes them right
-// away. It never leaves the Cloudflare network and stores no results.
+// On-demand reachability probe of the Telegram DC front-ends from THIS Cloudflare
+// edge location (Stage 5 ONLY — does NOT test user ISP -> Cloudflare connectivity).
+// Keeps at most 3 TCP sockets in the "connecting" phase and closes them immediately.
 async function probeDcs(cfg) {
   const keys = Object.keys(cfg.dc).map(Number).sort((a, b) => a - b);
   const results = [];
+  const tryConnectOnce = async (ip, port, timeoutMs) => {
+    const started = Date.now();
+    let socket = null;
+    let timer = null;
+    try {
+      socket = connect({ hostname: ip, port }, { secureTransport: "off" });
+      socket.closed.catch(() => {});
+      socket.opened.catch(() => {});
+      await Promise.race([
+        socket.opened,
+        new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("timeout")), timeoutMs); })
+      ]);
+      try { await socket.close(); } catch (_) {}
+      return { ok: true, port, ms: Date.now() - started };
+    } catch (_) {
+      if (socket) { try { socket.close().catch(() => {}); } catch (_) {} }
+      return { ok: false, port, ms: Date.now() - started };
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  };
   const probeOne = async (key) => {
     const ips = Array.isArray(cfg.dc[key]) ? cfg.dc[key] : [cfg.dc[key]];
     const ip = ips[Math.floor(Math.random() * ips.length)];
-    const started = Date.now();
-    let socket = null;
-    try {
-      socket = connect({ hostname: ip, port: cfg.dcPort || 443 }, { secureTransport: "off" });
-      socket.closed.catch(() => {});
-      await Promise.race([socket.opened, new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), 2500))]);
-      try { await socket.close(); } catch (_) {}
-      results.push({ dc: key, ip, ok: true, ms: Date.now() - started });
-    } catch (_) {
-      if (socket) { try { socket.close().catch(() => {}); } catch (_) {} }
-      results.push({ dc: key, ip, ok: false, ms: Date.now() - started });
+    const ports = Array.isArray(cfg.dcPorts) && cfg.dcPorts.length ? cfg.dcPorts : [cfg.dcPort || 443];
+    let outcome = await tryConnectOnce(ip, ports[0], 2200);
+    if (!outcome.ok && ports.length > 1) {
+      outcome = await tryConnectOnce(ip, ports[1], 2200);
     }
+    results.push({ dc: key, ip, port: outcome.port, ok: outcome.ok, ms: outcome.ms });
   };
   for (let i = 0; i < keys.length; i += 3) {
     await Promise.all(keys.slice(i, i + 3).map(probeOne));
   }
-  logEvent("dc_probe", results.map((r) => "DC" + r.dc + (r.ok ? ":ok" : ":fail")).join(" "));
+  results.sort((a, b) => a.dc - b.dc);
+  logEvent("dc_probe", results.map((r) => `DC${r.dc}:${r.port}:${r.ok ? "ok" : "fail"}`).join(" "));
   return results;
 }
 
-// Admin status & logs page: /<ADMIN_KEY>/status  (add ?probe=1 for a DC check)
-async function serveStatus(cfg, host, lang, wantsProbe) {
+// Admin status & diagnostics page: /<ADMIN_KEY>/status  (add ?probe=1 for a DC check)
+// Never prints ADMIN_KEY, SECRET, bearer tokens, bridge URLs, or client IPs.
+async function serveStatus(cfg, host, lang, wantsProbe, cfMeta) {
   STATS.statusViews++;
-  logEvent("status_view", host);
+  logEvent("status_view", host, [cfg.adminKey, cfg.secretHex]);
   const probe = wantsProbe ? await probeDcs(cfg) : null;
   const secretMode = cfg.secretDerived
     ? bi("derived from ADMIN_KEY", "مشتق‌شده از ADMIN_KEY")
     : (cfg.base ? bi("fixed SECRET", "SECRET ثابت") : "-");
+  const carrierLabel = cfg.carrierWarning
+    ? `${bi(escapeHtml(cfg.carrier) + " (requested: " + escapeHtml(cfg.carrierRequested || "-") + ")", escapeHtml(CARRIER_FA[cfg.carrier] || cfg.carrier) + " (درخواستی: " + escapeHtml(cfg.carrierRequested || "-") + ")")}`
+    : bi(escapeHtml(cfg.carrier), escapeHtml(CARRIER_FA[cfg.carrier] || cfg.carrier));
+  const edgeColo = cfMeta && typeof cfMeta.colo === "string" ? cfMeta.colo : "-";
+  const edgeProto = cfMeta && typeof cfMeta.httpProtocol === "string" ? cfMeta.httpProtocol : "-";
+  const edgeTls = cfMeta && typeof cfMeta.tlsVersion === "string" ? cfMeta.tlsVersion : "-";
   const infoRows = [
     [bi("Version", "نسخه"), escapeHtml(VERSION)],
-    [bi("Carrier", "حامل"), escapeHtml(cfg.carrier)],
+    [bi("Request host &amp; edge (no client IP)", "دامنه و سرور لبه همین درخواست (بدون IP کاربر)"), bi(
+      `${escapeHtml(host)} &middot; PoP: <code>${escapeHtml(edgeColo)}</code> &middot; ${escapeHtml(edgeProto)} &middot; ${escapeHtml(edgeTls)}`,
+      `${escapeHtml(host)} &middot; دیتاسنتر لبه: <code>${escapeHtml(edgeColo)}</code> &middot; ${escapeHtml(edgeProto)} &middot; ${escapeHtml(edgeTls)}`
+    )],
+    [bi("Active carrier", "حامل فعال"), carrierLabel],
+    [bi("WS lanes → mux auto-fallback", "تبدیل خودکار چندکاناله به تک‌کاناله"), cfg.wsAutoFallback ? bi("enabled", "فعال") : bi("disabled", "غیرفعال")],
+    [bi("Speed / DC timeout profile (default link)", "پروفایل سرعت / تایم‌اوت DC (لینک اصلی)"), bi(
+      `<code>${escapeHtml(cfg.speedProfile)}</code> / <code>${escapeHtml(cfg.dcProfile)}</code>`,
+      `${escapeHtml(SPEED_FA[cfg.speedProfile] || cfg.speedProfile)} / ${escapeHtml(DC_FA[cfg.dcProfile] || cfg.dcProfile)}`
+    ) + (cfg.panelOverride ? ` <span class="badge badge-ok">${bi("from SETTINGS_KV", "ذخیره‌شده در SETTINGS_KV")}</span>` : "")],
+    [bi("Optional SETTINGS_KV binding (Panel Save)", "بایندینگ اختیاری SETTINGS_KV (ذخیره پنل)"), cfg.hasKvBinding ? bi("attached (global panel save active)", "متصل (ذخیره سراسری پنل فعال)") : bi("not bound (Per-Operator links work without KV)", "متصل نیست (لینک‌های هر اپراتور بدون KV فعال‌اند)")],
+    [bi("Optional PROXY_DO binding (HTTPS)", "بایندینگ اختیاری PROXY_DO (HTTPS)"), cfg.hasDoBinding ? bi("attached", "متصل") : bi("not bound (stateless Free mode)", "متصل نیست (حالت تک‌فایل رایگان)")],
+    [bi("Uplink pacing (mux / lane / https)", "بسته‌بندی آپلود (تک‌کاناله / چندکاناله / HTTPS)"), bi(
+      `${fmtBytes(cfg.wsBatchBytes)} (hw ${fmtBytes(cfg.wsBufferHighWater)}) / ${fmtBytes(cfg.laneBatchBytes)} / ${fmtBytes(cfg.httpsUpBatch)} adaptive`,
+      `تک‌کاناله: ${fmtBytes(cfg.wsBatchBytes)} (سقف بافر ${fmtBytes(cfg.wsBufferHighWater)}) &middot; چندکاناله: ${fmtBytes(cfg.laneBatchBytes)} &middot; HTTPS تطبیقی: ${fmtBytes(cfg.httpsUpBatch)}`
+    )],
     [bi("Secret mode", "حالت سکرت"), secretMode],
-    [bi("Max streams per session", "حداکثر استریم در هر نشست"), String(cfg.maxStreams)],
-    [bi("AD_TAG", "AD_TAG"), cfg.adTag ? bi("set (ignored in Direct-DC mode)", "تنظیم شده (در حالت Direct-DC بی‌اثر)") : bi("not set", "تنظیم نشده")]
+    [bi("Max streams / concurrent DC dials", "حداکثر استریم / اتصال هم‌زمان DC"), `${cfg.maxStreams} / ${cfg.dcMaxConcurrentDials}`],
+    [bi("DC failover ports / timeouts", "پورت‌ها و تایم‌اوت DC"), bi(
+      `${escapeHtml(cfg.dcPorts.join(", "))} (${cfg.dcConnectTimeoutMs}ms / ${cfg.dcTotalTimeoutMs}ms max)`,
+      `${escapeHtml(cfg.dcPorts.join("، "))} (${cfg.dcConnectTimeoutMs} / حداکثر ${cfg.dcTotalTimeoutMs} میلی‌ثانیه)`
+    )],
+    [bi("AD_TAG", "AD_TAG"), cfg.adTag ? bi("set (NOT active — ignored in Direct-DC mode)", "تنظیم شده (غیرفعال — در حالت Direct-DC بی‌اثر)") : bi("not set", "تنظیم نشده")]
   ].map((row) => `<tr><th>${row[0]}</th><td>${row[1]}</td></tr>`).join("");
+
+  const stageRows = [
+    [
+      bi("1. DNS / TLS / Edge access", "۱. DNS / TLS و دسترسی به ورکر"),
+      bi(
+        `decoy/root: ${STATS.pageHits} &middot; panel: ${STATS.panelViews} &middot; status: ${STATS.statusViews}<br><span class="muted">edge: ${escapeHtml(edgeColo)} / ${escapeHtml(edgeProto)} / ${escapeHtml(edgeTls)}</span>`,
+        `صفحه اصلی: ${STATS.pageHits} &middot; پنل: ${STATS.panelViews} &middot; وضعیت: ${STATS.statusViews}<br><span class="muted">لبه: ${escapeHtml(edgeColo)} / ${escapeHtml(edgeProto)} / ${escapeHtml(edgeTls)}</span>`
+      ),
+      bi("If 0 when you visit the domain, DNS/SNI/TLS/Cloudflare IP is blocked before reaching the Worker.", "اگر با باز کردن دامنه ۰ بماند، DNS، SNI، TLS یا IP کلودفلر پیش از رسیدن به ورکر مسدود است.")
+    ],
+    [
+      bi("2. Bridge handshake (/?bridge=)", "۲. هندشیک Bridge (/?bridge=)"),
+      bi(
+        `<span class="ok">ok: ${STATS.bridgeOk}</span> &middot; <span class="${STATS.bridgeRejects ? "bad" : "muted"}">reject: ${STATS.bridgeRejects}</span>`,
+        `<span class="ok">موفق: ${STATS.bridgeOk}</span> &middot; <span class="${STATS.bridgeRejects ? "bad" : "muted"}">ردشده: ${STATS.bridgeRejects}</span>`
+      ),
+      bi("ok=0 while Stage 1 works: Telegram WebView cannot reach this host. reject>0: secret or domain mismatch.", "اگر مرحله ۱ کار کند ولی موفق=۰ باشد، WebView تلگرام به دامنه نرسیده؛ ردشده>۰ یعنی سکرت یا دامنه ناهماهنگ است.")
+    ],
+    [
+      bi("3. Session bootstrap (/api/v1/session)", "۳. ساخت نشست (/api/v1/session)"),
+      bi(
+        `<span class="ok">ok: ${STATS.sessionCreateOk}</span> &middot; <span class="${STATS.sessionCreateRejects ? "bad" : "muted"}">reject: ${STATS.sessionCreateRejects}</span>`,
+        `<span class="ok">موفق: ${STATS.sessionCreateOk}</span> &middot; <span class="${STATS.sessionCreateRejects ? "bad" : "muted"}">ردشده: ${STATS.sessionCreateRejects}</span>`
+      ),
+      bi("Stage 2 ok but Stage 3=0: WebView loaded bridge HTML but HTTPS POST failed or timed out.", "اگر مرحله ۲ موفق و مرحله ۳ صفر باشد، صفحه bridge باز شده ولی درخواست POST ناموفق یا تایم‌اوت شده است.")
+    ],
+    [
+      bi("4. Carrier transport (WSS / HTTPS)", "۴. انتقال داده (WebSocket / HTTPS)"),
+      bi(
+        `ws-lanes: ${STATS.wsLanesOpened} &middot; ws-mux: ${STATS.wsMuxOpened} &middot; active: ${STATS.sessionsActive} &middot; <span class="${STATS.wsRejects ? "bad" : "muted"}">ws-reject: ${STATS.wsRejects}</span>`,
+        `چندکاناله: ${STATS.wsLanesOpened} &middot; تک‌کاناله: ${STATS.wsMuxOpened} &middot; فعال: ${STATS.sessionsActive} &middot; <span class="${STATS.wsRejects ? "bad" : "muted"}">ردشده: ${STATS.wsRejects}</span>`
+      )
+        + (cfg.carrier === "websocket-lanes" && STATS.wsMuxOpened > 0
+          ? `<br><span class="badge badge-warn">${bi("lanes→mux fallback observed", "تبدیل خودکار چندکاناله به تک‌کاناله رخ داده")}</span>`
+          : "")
+        + (cfg.hasDoBinding || STATS.httpsSessions || STATS.httpsUpOk || STATS.httpsDownOk
+          ? `<br>` + bi(
+              `https-do: init=${STATS.httpsSessions}, up=${STATS.httpsUpOk}/${STATS.httpsUpRejects}, down=${STATS.httpsDownOk}/${STATS.httpsDownRejects}`,
+              `HTTPS (DO): نشست=${STATS.httpsSessions} &middot; ارسال=${STATS.httpsUpOk}/${STATS.httpsUpRejects} &middot; دریافت=${STATS.httpsDownOk}/${STATS.httpsDownRejects}`
+            )
+          : ""),
+      bi("Stage 3 ok but WS=0: ISP/mobile carrier (e.g. Irancell) is likely blocking/throttling WebSocket Upgrade. Try CARRIER=websocket or optional PROXY_DO + CARRIER=https.", "اگر مرحله ۳ موفق ولی WebSocket صفر باشد، احتمالاً اپراتور (مثل ایرانسل) WebSocket را مسدود یا مختل می‌کند. پروفایل موبایل تک‌کاناله یا گزینه PROXY_DO + HTTPS را بررسی کنید.")
+    ],
+    [
+      bi("5. MTProto header &amp; Outbound DC", "۵. هدر MTProto و اتصال خروجی DC"),
+      bi(
+        `header ok/bad: ${STATS.streamsHeaderOk}/${STATS.streamsHeaderFail}<br><span class="ok">dc ok: ${STATS.dcOk}</span> (443:${STATS.dcOk443}, 80:${STATS.dcOk80}, 5222:${STATS.dcOk5222}) &middot; <span class="${STATS.dcFails ? "bad" : "muted"}">fail: ${STATS.dcFails}</span> (timeout:${STATS.dcTimeouts}, err:${STATS.dcErrors})`,
+        `هدر موفق/نامعتبر: ${STATS.streamsHeaderOk}/${STATS.streamsHeaderFail}<br><span class="ok">اتصال DC موفق: ${STATS.dcOk}</span> (443:${STATS.dcOk443}، 80:${STATS.dcOk80}، 5222:${STATS.dcOk5222}) &middot; <span class="${STATS.dcFails ? "bad" : "muted"}">ناموفق: ${STATS.dcFails}</span> (تایم‌اوت:${STATS.dcTimeouts}، خطا:${STATS.dcErrors})`
+      ),
+      bi("header bad>0: secret mismatch. dc fail>0: Cloudflare→Telegram egress failure (separate from user ISP).", "اگر هدر نامعتبر>۰ باشد سکرت ناهماهنگ است. خطای DC مربوط به مسیر کلودفلر به تلگرام است نه اپراتور کاربر.")
+    ]
+  ].map((row) => `<tr><th>${row[0]}</th><td>${row[1]}</td><td class="muted">${row[2]}</td></tr>`).join("");
+
   const statsRows = [
-    [bi("Proxy sessions", "نشست‌های پروکسی"), String(STATS.sessions)],
-    [bi("Active sessions (isolate)", "نشست‌های فعال (این ایزوله)"), String(STATS.sessionsActive)],
-    [bi("Streams opened", "استریم‌های باز شده"), String(STATS.streams)],
-    [bi("DC connects ok / failed", "اتصال‌های DC موفق / ناموفق"), (STATS.dcAttempts - STATS.dcFails) + " / " + STATS.dcFails],
-    [bi("Traffic up / down", "ترافیک بالا / پایین"), fmtBytes(STATS.bytesUp) + " / " + fmtBytes(STATS.bytesDown)],
-    [bi("Rejected WS tokens", "توکن‌های WebSocket ردشده"), String(STATS.wsRejects)],
+    [bi("WS sessions (isolate total / active)", "نشست‌های WS (کل / فعال در این ایزوله)"), `${STATS.sessions} / ${STATS.sessionsActive}`],
+    [bi("MTProto streams opened", "استریم‌های MTProto بازشده"), String(STATS.streams)],
+    [bi("Traffic up / down", "ترافیک ارسال / دریافت"), fmtBytes(STATS.bytesUp) + " / " + fmtBytes(STATS.bytesDown)],
     [bi("Isolate uptime", "مدت فعالیت این ایزوله"), fmtDuration(Date.now() - ISOLATE_START)]
   ].map((row) => `<tr><th>${row[0]}</th><td>${escapeHtml(row[1])}</td></tr>`).join("");
+
+  const probeDisclaimer = `<p class="muted" style="margin-top:6px"><b>${bi("Important:", "مهم:")}</b> ${bi(
+    "This probe ONLY checks outbound TCP reachability from this Cloudflare edge server to Telegram DCs (Stage 5). Passing this probe does NOT mean end-to-end user connectivity works on Irancell or your ISP.",
+    "این تست فقط دسترسی خروجی TCP از همین سرور کلودفلر به دیتاسنترهای تلگرام (مرحله ۵) را بررسی می‌کند. نتیجه موفق به هیچ وجه به معنای موفقیت اتصال کامل کاربر روی ایرانسل یا اینترنت شما نیست."
+  )}</p>`;
+
   const probeBlock = probe
-    ? `<div class="card"><b>${bi("DC reachability probe", "تست دسترسی به دیتاسنترها")}</b><table><tr><th>DC</th><th>IP</th><th>${bi("Result", "نتیجه")}</th></tr>${probe.map((r) => `<tr><td>DC${r.dc}</td><td>${escapeHtml(r.ip)}</td><td class="${r.ok ? "ok" : "bad"}">${r.ok ? "OK" : "FAIL"} (${r.ms} ms)</td></tr>`).join("")}</table></div>`
-    : `<div class="card"><a class="plain" href="?probe=1">${bi("Run DC reachability probe", "اجرای تست دسترسی به دیتاسنترهای تلگرام")}</a><p class="muted">${bi("Opens and immediately closes one TCP socket per DC from this Cloudflare location.", "برای هر دیتاسنتر یک اتصال TCP از همین لوکیشن کلودفلر باز و بلافاصله بسته می‌شود.")}</p></div>`;
-  const logRows = LOG.slice(-60).reverse().map((e) => `<tr><td>${new Date(e.t).toISOString().slice(11, 19)}</td><td>${escapeHtml(e.event)}</td><td>${escapeHtml(e.detail)}</td></tr>`).join("");
-  const logsBlock = `<div class="card"><b>${bi("Recent events", "رویدادهای اخیر")}</b> <span class="muted">${bi("(newest first, isolate memory only)", "(جدیدترین اول، فقط حافظه همین ایزوله)")}</span><table><tr><th>UTC</th><th>event</th><th>detail</th></tr>${logRows || `<tr><td colspan="3">-</td></tr>`}</table></div>`;
-  const body = `<h1>${bi("Proxy status", "وضعیت پروکسی")}</h1>
-<div class="card muted">${bi(
-    "Counters and logs are kept in this Cloudflare isolate only, reset when it is recycled, and are not shared between regions. No client IP addresses, tokens or secrets are recorded.",
-    "شمارنده‌ها و لاگ‌ها فقط در حافظه همین ایزوله کلودفلر نگهداری می‌شوند، با بازیافت ایزوله صفر می‌شوند و بین منطقه‌ها مشترک نیستند. هیچ IP، توکن یا سکرتی ثبت نمی‌شود."
+    ? `<div class="card"><b>${bi("Cloudflare → Telegram DC probe (Stage 5 only)", "تست دسترسی کلودفلر به دیتاسنترهای تلگرام (فقط مرحله ۵)")}</b>${probeDisclaimer}<table><tr><th>${bi("DC", "دیتاسنتر")}</th><th>${bi("IP", "آی‌پی")}</th><th>${bi("Port", "پورت")}</th><th>${bi("Result", "نتیجه")}</th></tr>${probe.map((r) => `<tr><td>DC${r.dc}</td><td><code>${escapeHtml(r.ip)}</code></td><td>${r.port}</td><td class="${r.ok ? "ok" : "bad"}">${r.ok ? bi("OK", "موفق") : bi("FAIL", "ناموفق")} (${r.ms} ${bi("ms", "میلی‌ثانیه")})</td></tr>`).join("")}</table></div>`
+    : `<div class="card"><a class="plain en" href="?probe=1">Run Cloudflare → Telegram DC probe (Stage 5 only)</a><a class="plain fa" href="?probe=1&amp;lang=fa">اجرای تست دسترسی کلودفلر به دیتاسنترهای تلگرام (فقط مرحله ۵)</a>${probeDisclaimer}</div>`;
+
+  const logRows = LOG.slice(-60).reverse().map((e) => `<tr><td>${new Date(e.t).toISOString().slice(11, 19)}</td><td><code>${escapeHtml(e.event)}</code></td><td>${escapeHtml(e.detail)}</td></tr>`).join("");
+  const logsBlock = `<div class="card"><b>${bi("Recent sanitized events", "رویدادهای اخیر (پاک‌سازی‌شده)")}</b> <span class="muted">${bi("(newest first, isolate RAM only — no keys, secrets, tokens, bridge URLs, or IPs)", "(جدیدترین اول، فقط حافظه همین ایزوله — بدون کلید، سکرت، توکن، URL کامل bridge یا IP کاربر)")}</span><table><tr><th>${bi("UTC", "زمان (UTC)")}</th><th>${bi("Event", "رویداد")}</th><th>${bi("Detail", "جزئیات")}</th></tr>${logRows || `<tr><td colspan="3">-</td></tr>`}</table></div>`;
+
+  const body = `<h1>${bi("Proxy status &amp; diagnostics", "وضعیت و عیب‌یابی پروکسی")}</h1>
+<div class="card warn"><b>${bi("Isolate-local memory limit:", "محدودیت حافظه محلی ایزوله:")}</b> ${bi(
+    "All counters and logs below exist ONLY in this single Cloudflare Worker isolate's RAM. Cloudflare runs multiple isolates across edge locations and recycles them at any time. Seeing 0 here can happen if Telegram routed to a different isolate than your browser. No client IP addresses, ADMIN_KEY, secrets, tokens, or full bridge URLs are ever stored.",
+    "تمامی شمارنده‌ها و لاگ‌های زیر فقط در حافظه RAM همین ایزوله کلودفلر نگهداری می‌شوند، با بازیافت ایزوله صفر می‌شوند و بین سرورها یا ایزوله‌های دیگر مشترک نیستند. صفر بودن شمارنده‌ها می‌تواند به دلیل اتصال تلگرام به یک ایزوله دیگر کلودفلر نیز باشد. هیچ IP کاربر، ADMIN_KEY، سکرت، توکن یا URL کامل bridge ذخیره نمی‌شود."
   )}</div>
+${carrierWarningCard(cfg)}
 <div class="card"><b>${bi("Configuration", "پیکربندی")}</b><table>${infoRows}</table></div>
-<div class="card"><b>${bi("Live statistics", "آمار زنده")}</b><table>${statsRows}</table></div>
+<div class="card"><b>${bi("5-Stage Connection Diagnostics", "تشخیص مرحله‌به‌مرحله خطای اتصال")}</b><table><tr><th>${bi("Stage", "مرحله")}</th><th>${bi("Counters (this isolate)", "شمارنده‌ها (همین ایزوله)")}</th><th>${bi("Interpretation", "تفسیر")}</th></tr>${stageRows}</table></div>
+<div class="card"><b>${bi("Traffic &amp; isolate summary", "خلاصه ترافیک و ایزوله")}</b><table>${statsRows}</table></div>
 ${probeBlock}
 ${logsBlock}`;
-  return new Response(bilingualPage("Status", lang, body, await unseal()), { status: 200, headers: pageHeaders() });
+  return new Response(bilingualPage(lang === "fa" ? "وضعیت و عیب‌یابی پروکسی" : "Proxy Status", lang, body, await unseal()), { status: 200, headers: pageHeaders() });
 }
 
 async function issueToken(cfg, kind, ttl, mode) {
@@ -1544,25 +2614,51 @@ async function verifyToken(cfg, token, kind) {
   return { nonce, mode: nonce[4] };
 }
 
-async function decoy(decoyUrl, requestMethod = "GET") {
+function isUnsafeDecoyHost(h, selfHost) {
+  const host = String(h || "").toLowerCase().replace(/^\[|\]$/g, "");
+  if (!host || (selfHost && host === String(selfHost).toLowerCase())) return true;
+  if (host === "localhost" || host === "0.0.0.0" || host === "::1" || host.endsWith(".localhost") || host.endsWith(".local")) return true;
+  if (/^(127\.|10\.|192\.168\.|169\.254\.|0\.)/.test(host)) return true;
+  if (/^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(host)) return true;
+  if (/^(fc|fd|fe80:)/i.test(host)) return true;
+  return false;
+}
+
+async function decoy(decoyUrl, requestMethod = "GET", reqPath = "/", selfHost = "") {
   if (decoyUrl && typeof decoyUrl === "string" && (decoyUrl.startsWith("http://") || decoyUrl.startsWith("https://"))) {
+    let controller = null;
+    let timer = null;
     try {
-      const upstream = await fetch(decoyUrl, {
-        method: requestMethod === "HEAD" ? "HEAD" : "GET",
-        headers: {
-          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-        }
-      });
-      const status = upstream.status >= 200 && upstream.status <= 599 ? upstream.status : 200;
-      const nullBody = requestMethod === "HEAD" || status === 204 || status === 205 || status === 304;
-      return new Response(nullBody ? null : upstream.body, {
-        status,
-        headers: {
-          "Content-Type": upstream.headers.get("Content-Type") || "text/html; charset=utf-8",
-          "Cache-Control": "no-cache"
-        }
-      });
-    } catch (_) {}
+      const parsed = new URL(decoyUrl);
+      const h = parsed.hostname.toLowerCase();
+      if (!isUnsafeDecoyHost(h, selfHost)) {
+        const cleanPath = typeof reqPath === "string" && reqPath.startsWith("/") ? reqPath : "/";
+        const targetUrl = (cleanPath === "/" && parsed.pathname && parsed.pathname !== "/")
+          ? parsed.href
+          : parsed.origin + cleanPath;
+        controller = new AbortController();
+        timer = setTimeout(() => controller.abort(), 5000);
+        const upstream = await fetch(targetUrl, {
+          method: requestMethod === "HEAD" ? "HEAD" : "GET",
+          signal: controller.signal,
+          headers: {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+          }
+        });
+        const status = upstream.status >= 200 && upstream.status <= 599 ? upstream.status : 200;
+        const nullBody = requestMethod === "HEAD" || status === 204 || status === 205 || status === 304;
+        return new Response(nullBody ? null : upstream.body, {
+          status,
+          headers: {
+            "Content-Type": upstream.headers.get("Content-Type") || "text/html; charset=utf-8",
+            "Cache-Control": "no-cache"
+          }
+        });
+      }
+    } catch (_) {
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
   const headers = {
     "Content-Type": "text/html; charset=utf-8",
@@ -1587,18 +2683,30 @@ function notFound() {
 }
 
 async function serveBridge(cfg, host, mode, port) {
+  const effective = resolveProfileConfig(cfg, mode);
   const nonce = b64uEncode(crypto.getRandomValues(new Uint8Array(18)));
-  const bootstrap = await issueToken(cfg, TOKEN_KIND_BOOTSTRAP, cfg.bootstrapTtl, mode);
+  const bootstrap = await issueToken(cfg, TOKEN_KIND_BOOTSTRAP, effective.bootstrapTtl, mode);
   const authority = (port && port !== "443" && port !== "80") ? `${host}:${port}` : host;
   const relayBase = JSON.stringify("https://" + authority + "/");
   const body = BRIDGE_HTML
     .replaceAll("__NONCE__", nonce)
     .replaceAll("__RELAY_BASE__", relayBase)
     .replaceAll("__BOOTSTRAP__", JSON.stringify(bootstrap))
-    .replaceAll("__CARRIER_MODE__", JSON.stringify(cfg.carrier))
-    .replaceAll("__BATCH_LIMIT__", String(cfg.batchBytes))
-    .replaceAll("__SESSION_PATH__", JSON.stringify(cfg.sessionPath.replace(/^\//, "")))
-    .replaceAll("__WS_PATH__", JSON.stringify(cfg.wsPath.replace(/^\//, "")));
+    .replaceAll("__CARRIER_MODE__", JSON.stringify(effective.carrier))
+    .replaceAll("__BATCH_LIMIT__", String(effective.batchBytes))
+    .replaceAll("__WS_BATCH_LIMIT__", String(effective.wsBatchBytes || 65536))
+    .replaceAll("__WS_HIGH_WATER__", String(effective.wsBufferHighWater || 262144))
+    .replaceAll("__LANE_BATCH_LIMIT__", String(effective.laneBatchBytes || 131072))
+    .replaceAll("__LANE_HIGH_WATER__", String(effective.laneBufferHighWater || 524288))
+    .replaceAll("__HTTPS_UP_BATCH__", String(effective.httpsUpBatch || 131072))
+    .replaceAll("__WS_INIT_RETRIES__", String(effective.wsInitRetries || 3))
+    .replaceAll("__LANE_OPEN_TIMEOUT__", String(effective.laneOpenTimeoutMs || 7500))
+    .replaceAll("__IDLE_TIMEOUT__", String(effective.idleTimeoutMs || 65000))
+    .replaceAll("__SESSION_PATH__", JSON.stringify(effective.sessionPath.replace(/^\//, "")))
+    .replaceAll("__WS_PATH__", JSON.stringify(effective.wsPath.replace(/^\//, "")))
+    .replaceAll("__UP_PATH__", JSON.stringify(effective.upPath.replace(/^\//, "")))
+    .replaceAll("__DOWN_PATH__", JSON.stringify(effective.downPath.replace(/^\//, "")))
+    .replaceAll("__WS_AUTO_FALLBACK__", effective.wsAutoFallback ? "true" : "false");
   const csp = [
     "default-src 'none'",
     "base-uri 'none'",
@@ -1617,6 +2725,8 @@ async function serveBridge(cfg, host, mode, port) {
     "worker-src 'none'",
     "sandbox allow-same-origin allow-scripts"
   ].join("; ");
+  STATS.bridgeOk++;
+  logEvent("bridge_ok", `host=${host} profile=${effective.activeProfileId} carrier=${effective.carrier}`);
   return new Response(body, {
     status: 200,
     headers: {
@@ -1668,6 +2778,101 @@ function safeDcHeaderPrefix(bytes) {
   return true;
 }
 
+// Builds a bounded, port-diverse DC connection plan so multi-IP DCs (like DC2
+// with 4 IPs) do not spend all 4 attempts exclusively on port 443.
+// Soft-deprioritizes endpoints that failed within DC_COOLDOWN_TTL_MS while
+// keeping them available if all healthy candidates fail.
+function buildDcAttemptPlan(candidateIps, candidatePorts, maxAttempts = 4, now = Date.now()) {
+  const ips = (Array.isArray(candidateIps) ? candidateIps : [candidateIps]).filter(Boolean).slice();
+  const ports = (Array.isArray(candidatePorts) && candidatePorts.length ? candidatePorts : [443]).slice();
+  if (!ips.length || !ports.length) return [];
+
+  for (let i = ips.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [ips[i], ips[j]] = [ips[j], ips[i]];
+  }
+
+  const limit = Math.max(1, Math.min(maxAttempts, ips.length * ports.length));
+  const picked = [];
+  const seen = new Set();
+  const addPair = (ip, port) => {
+    const k = ip + ":" + port;
+    if (seen.has(k)) return false;
+    seen.add(k);
+    picked.push([ip, port]);
+    return true;
+  };
+
+  // Pick up to 2 distinct IPs on primary port (preferring healthy endpoints first)
+  const primaryPort = ports[0];
+  const primaryLimit = Math.min(ports.length > 1 ? 2 : limit, ips.length, limit);
+  const primaryOrder = ips.slice().sort((a, b) => Number(isDcCooledDown(a, primaryPort, now)) - Number(isDcCooledDown(b, primaryPort, now)));
+  let ipCursor = 0;
+  for (let i = 0; i < primaryOrder.length && picked.length < primaryLimit; i++) {
+    addPair(primaryOrder[i], primaryPort);
+    ipCursor++;
+  }
+
+  // Ensure every fallback port (e.g. 80, 5222) gets a distinct IP within the attempt budget
+  for (let pIdx = 1; pIdx < ports.length && picked.length < limit; pIdx++) {
+    const port = ports[pIdx];
+    let chosen = null;
+    for (let step = 0; step < ips.length; step++) {
+      const candidate = ips[(ipCursor + step) % ips.length];
+      if (!seen.has(candidate + ":" + port) && !isDcCooledDown(candidate, port, now)) {
+        chosen = candidate;
+        ipCursor = (ipCursor + step + 1) % ips.length;
+        break;
+      }
+    }
+    if (!chosen) {
+      chosen = ips[ipCursor % ips.length];
+      ipCursor = (ipCursor + 1) % ips.length;
+    }
+    addPair(chosen, port);
+  }
+
+  // Fill any remaining slots without duplicates
+  for (const port of ports) {
+    for (const ip of ips) {
+      if (picked.length >= limit) break;
+      addPair(ip, port);
+    }
+    if (picked.length >= limit) break;
+  }
+
+  // Stable partition: healthy pairs first, recently failed pairs second
+  const healthy = [];
+  const cooled = [];
+  for (const pair of picked) {
+    if (isDcCooledDown(pair[0], pair[1], now)) cooled.push(pair);
+    else healthy.push(pair);
+  }
+  return healthy.concat(cooled).slice(0, limit);
+}
+
+async function resolveSecretForMode(cfg, mode, host, port) {
+  let secret = cfg.base;
+  if (mode >= PROFILE_MODE_BASE && mode < PROFILE_MODE_BASE + OPERATOR_PROFILES.length) {
+    const prof = OPERATOR_PROFILES[mode - PROFILE_MODE_BASE];
+    secret = cfg.profileSecrets?.[prof.id]?.secret || cfg.base;
+  } else if (mode >= PORT_MODE_BASE && mode < PORT_MODE_BASE + HTTPS_PORTS.length) {
+    const portNum = HTTPS_PORTS[mode - PORT_MODE_BASE];
+    secret = cfg.portSecrets?.[portNum]?.secret || cfg.base;
+  } else if (mode === 1 || mode === 2) {
+    const label = mode === 2 && port && port !== "443" && port !== "80" ? `${host}:${port}` : host;
+    secret = await deriveSecret(cfg, label);
+  }
+  return secret || null;
+}
+
+function bytesEqual(a, b) {
+  if (!a || !b || a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a[i] ^ b[i];
+  return diff === 0;
+}
+
 class Stream {
   constructor(session, id) {
     this.session = session;
@@ -1679,6 +2884,11 @@ class Stream {
     this.headerLength = 0;
     this.dead = false;
     this.socket = null;
+    this.pendingSocket = null;
+    this.abortConnect = null;
+    this.dialWaitCancel = null;
+    this.downlinkWaitCancel = null;
+    this.writeTimer = null;
     this.writer = null;
     this.reader = null;
     this.inQueue = [];
@@ -1719,13 +2929,40 @@ class Stream {
     this.runIn();
   }
 
+  dequeueReadyBatch() {
+    const first = this.inQueue.shift();
+    if (!first) return null;
+    const maxBatch = this.session.cfg.dataChunk || 65536;
+    if (!this.inQueue.length || first.length >= maxBatch) {
+      this.queuedLocal -= first.length;
+      this.session.queued -= first.length;
+      return first;
+    }
+    const parts = [first];
+    let total = first.length;
+    while (this.inQueue.length && total + this.inQueue[0].length <= maxBatch) {
+      const next = this.inQueue.shift();
+      parts.push(next);
+      total += next.length;
+    }
+    this.queuedLocal -= total;
+    this.session.queued -= total;
+    const merged = new Uint8Array(total);
+    let offset = 0;
+    for (const part of parts) {
+      merged.set(part, offset);
+      offset += part.length;
+    }
+    return merged;
+  }
+
   async runIn() {
     if (this.inRunning || this.dead) return;
     this.inRunning = true;
     try {
       while (!this.dead && this.inQueue.length) {
-        let payload = this.inQueue[0];
         if (this.phase === "header") {
+          let payload = this.inQueue[0];
           const need = 64 - this.headerLength;
           const take = Math.min(need, payload.length);
           this.header.set(payload.subarray(0, take), this.headerLength);
@@ -1741,16 +2978,34 @@ class Stream {
           }
           continue;
         }
-        this.inQueue.shift();
-        this.queuedLocal -= payload.length;
-        this.session.queued -= payload.length;
-        await this.writeToDc(payload);
+        const batch = this.dequeueReadyBatch();
+        if (batch) await this.writeToDc(batch);
       }
     } catch (_) {
       this.kill(true);
     } finally {
       this.inRunning = false;
       if (!this.dead && this.inQueue.length) this.runIn();
+    }
+  }
+
+  async writeWithTimeout(bytes) {
+    if (this.dead || !this.writer) throw new Error("stream dead");
+    const timeoutMs = this.session.cfg.dcWriteTimeoutMs || 25000;
+    let timer = null;
+    try {
+      const writePromise = this.writer.write(bytes);
+      writePromise.catch(() => {});
+      await Promise.race([
+        writePromise,
+        new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error("dc write timeout")), timeoutMs);
+          this.writeTimer = timer;
+        })
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+      if (this.writeTimer === timer) this.writeTimer = null;
     }
   }
 
@@ -1762,32 +3017,38 @@ class Stream {
     this.clientReadIv = readIv;
     const tail = await ctrAt(this.clientReadKey, readIv, 56, header.subarray(56, 64));
     const tag = tail.subarray(0, 4);
-    if (!tagKind(tag)) throw new Error("bad tag");
+    if (!tagKind(tag)) {
+      STATS.streamsHeaderFail++;
+      logEvent("header_fail", "bad protocol tag");
+      throw new Error("bad tag");
+    }
     const dcId = new DataView(tail.buffer, tail.byteOffset + 4, 2).getInt16(0, true);
     const dcKey = Math.abs(dcId);
     const address = this.session.cfg.dc[dcKey];
-    if (!address) throw new Error("bad dc");
+    if (!address) {
+      STATS.streamsHeaderFail++;
+      logEvent("header_fail", `unknown dc=${dcKey}`);
+      throw new Error("bad dc");
+    }
+    STATS.streamsHeaderOk++;
 
     const candidateIps = Array.isArray(address) ? address : [address];
     const candidatePorts = Array.isArray(this.session.cfg.dcPorts) ? this.session.cfg.dcPorts : [this.session.cfg.dcPort || 443];
 
     // Middle-End / Ad Tag Routing Check:
-    // If AD_TAG is configured, note protocol constraint: native ME handshake requires
-    // preserving outbound TCP source port which Cloudflare Workers' NAPT does not support.
+    // Native ME handshake requires preserving outbound TCP source port which
+    // Cloudflare Workers' NAPT does not support; Direct-DC mode is always used.
     if (this.session.cfg.adTag && this.session.cfg.debug && !this.session.loggedMeNotice) {
       this.session.loggedMeNotice = true;
-      console.log("[tgweb] AD_TAG configured. Native Middle-End handshake from Cloudflare Workers is blocked by Cloudflare egress NAPT (source port translation prevents ME key agreement). Falling back cleanly to Direct-DC mode.");
+      console.log("[tgweb] AD_TAG is set but inactive in Direct-DC mode (Cloudflare egress NAPT translates source ports).");
     }
 
     const reversed = reverse(header.subarray(8, 56));
     const writeKey = await sha256(concat(reversed.subarray(0, 32), this.session.secret));
     const clientWriteIv = reversed.slice(32, 48);
 
-    // FAST MODE (same idea as mtprotoproxy FAST_MODE):
-    // The DC derives its *encrypt* key/iv from reverse(dcHeader[8..56]). We choose
-    // dcHeader[8..56] = reverse(clientWriteKey || clientWriteIv), so the DC encrypts
-    // with exactly the key stream the client expects. DC->client bytes are then
-    // forwarded untouched: no AES work for the heavy (download) direction.
+    // FAST MODE: choose dcHeader[8..56] = reverse(clientWriteKey || clientWriteIv)
+    // so DC->client bytes are encrypted with the exact keystream client expects.
     const dcKeyMaterial = reverse(concat(writeKey, clientWriteIv)); // 48 bytes
     this.dcWriteKey = await importAes(dcKeyMaterial.slice(0, 32));
     this.dcWriteIv = dcKeyMaterial.slice(32, 48);
@@ -1797,46 +3058,86 @@ class Stream {
     this.dcWritePos = 64;
     this.dcReadPos = 0;
 
-    // Connect to the DC with bounded failover. Every connect() is a subrequest
-    // (50 per invocation on Free) and occupies one of the 6 "connecting" slots,
-    // so: few attempts, random IP order (spreads load), and always close losers.
+    // Bounded, port-diverse DC failover respecting Cloudflare Free limits:
+    // - at most 4 attempts covering multiple IPs AND fallback ports (443, 80, 5222)
+    // - bounded per-attempt (2.2s) and total (7.5s) deadlines
+    // - per-session dial semaphore (<= 4 concurrent connects, below CF limit of 6)
+    // - immediate close of timed-out / aborted sockets to prevent slot leaks
     let socket = null;
     let lastError = null;
-    const ips = candidateIps.slice();
-    for (let i = ips.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [ips[i], ips[j]] = [ips[j], ips[i]];
-    }
-    const attempts = [];
-    for (const port of candidatePorts) for (const hostIp of ips) attempts.push([hostIp, port]);
-    const maxAttempts = Math.min(attempts.length, 4);
+    const attempts = buildDcAttemptPlan(candidateIps, candidatePorts, this.session.cfg.dcMaxAttempts || 4);
+    const totalDeadline = Date.now() + (this.session.cfg.dcTotalTimeoutMs || 7500);
 
-    for (let a = 0; a < maxAttempts && !socket; a++) {
+    for (let a = 0; a < attempts.length && !socket; a++) {
       if (this.dead) return;
+      const remaining = totalDeadline - Date.now();
+      if (remaining < 400) {
+        lastError = lastError || new Error("dc connect budget exceeded");
+        break;
+      }
+      if (this.session.tryReserveSubrequest && !this.session.tryReserveSubrequest()) {
+        lastError = new Error("subrequest budget reached");
+        break;
+      }
+      const attemptTimeout = Math.min(this.session.cfg.dcConnectTimeoutMs || 2200, remaining);
       const [hostIp, port] = attempts[a];
+
+      let acquired = false;
+      if (this.session.acquireDialSlot) {
+        acquired = await this.session.acquireDialSlot(this);
+        if (!acquired || this.dead) {
+          if (acquired) this.session.releaseDialSlot();
+          return;
+        }
+      }
+
       STATS.dcAttempts++;
       let candidateSocket = null;
       let timer = null;
+      let abortReject = null;
       try {
         candidateSocket = connect({ hostname: hostIp, port }, { secureTransport: "off" });
+        this.pendingSocket = candidateSocket;
         candidateSocket.closed.catch(() => {});
-        const timeoutPromise = new Promise((_, reject) => {
-          timer = setTimeout(() => reject(new Error("connect timeout")), 3000);
+        candidateSocket.opened.catch(() => {});
+        const guardPromise = new Promise((_, reject) => {
+          abortReject = reject;
+          timer = setTimeout(() => reject(new Error("connect timeout")), attemptTimeout);
         });
-        await Promise.race([candidateSocket.opened, timeoutPromise]);
+        this.abortConnect = () => {
+          if (abortReject) abortReject(new Error("stream aborted"));
+        };
+        await Promise.race([candidateSocket.opened, guardPromise]);
+        if (this.dead) {
+          try { candidateSocket.close().catch(() => {}); } catch (_) {}
+          return;
+        }
         socket = candidateSocket;
+        clearDcCooldown(hostIp, port);
+        STATS.dcOk++;
+        if (port === 443) STATS.dcOk443++;
+        else if (port === 80) STATS.dcOk80++;
+        else if (port === 5222) STATS.dcOk5222++;
       } catch (connErr) {
         lastError = connErr;
-        STATS.dcFails++;
-        // Previously a timed-out socket stayed pending and kept a connection slot busy.
+        if (!this.dead) {
+          STATS.dcFails++;
+          const msg = String(connErr && connErr.message ? connErr.message : connErr);
+          if (/timeout/i.test(msg)) STATS.dcTimeouts++;
+          else STATS.dcErrors++;
+          markDcCooldown(hostIp, port);
+        }
         if (candidateSocket) { try { candidateSocket.close().catch(() => {}); } catch (_) {} }
       } finally {
         if (timer) clearTimeout(timer);
+        this.abortConnect = null;
+        this.pendingSocket = null;
+        if (acquired && this.session.releaseDialSlot) this.session.releaseDialSlot();
       }
     }
 
     if (!socket) {
-      logEvent("dc_fail", `dc=${dcKey}`);
+      logEvent("dc_fail", `dc=${dcKey} attempts=${attempts.length}`);
       throw lastError || new Error("failed to connect to DC");
     }
 
@@ -1848,7 +3149,9 @@ class Stream {
     this.writer = socket.writable.getWriter();
     this.reader = socket.readable.getReader();
 
-    // Construct and send initial Obfuscated2 header to the Telegram DC
+    // Construct and send initial Obfuscated2 header to the Telegram DC.
+    // Once bytes are written to this socket, this stream is bound strictly to
+    // this DC TCP connection — never replayed on a second socket if it fails.
     const dcHeader = new Uint8Array(64);
     let safe = false;
     for (let i = 0; i < 16 && !safe; i++) {
@@ -1863,10 +3166,11 @@ class Stream {
     dcView.setUint16(62, 0, true);
     const encryptedTail = await ctrAt(this.dcWriteKey, this.dcWriteIv, 56, dcHeader.subarray(56, 64));
     dcHeader.set(encryptedTail, 56);
-    await this.writer.write(dcHeader);
+    await this.writeWithTimeout(dcHeader);
     if (this.dead) return;
     this.phase = "ready";
-    this.pump().catch(() => this.kill(true));
+    const pumpPromise = this.pump().catch(() => this.kill(true));
+    if (this.session.trackBackground) this.session.trackBackground(pumpPromise);
   }
 
   async writeToDc(payload) {
@@ -1876,7 +3180,7 @@ class Stream {
     if (this.dead) return;
     const encrypted = await ctrAt(this.dcWriteKey, this.dcWriteIv, this.dcWritePos, plain);
     this.dcWritePos += payload.length;
-    await this.writer.write(encrypted);
+    await this.writeWithTimeout(encrypted);
     this.grant(payload.length);
   }
 
@@ -1888,6 +3192,10 @@ class Stream {
           await this.waitCredit();
           continue;
         }
+        if (this.session.waitDownlinkReady) {
+          await this.session.waitDownlinkReady(this);
+          if (this.dead) break;
+        }
         const result = await reader.read();
         if (result.done) break;
         const value = result.value;
@@ -1897,12 +3205,16 @@ class Stream {
             await this.waitCredit();
             continue;
           }
+          if (this.session.waitDownlinkReady) {
+            await this.session.waitDownlinkReady(this);
+            if (this.dead) break;
+          }
           const size = Math.min(value.length - offset, this.sendCredit, this.session.cfg.dataChunk);
           if (size <= 0) continue;
           // Fast mode: bytes from the DC are already encrypted for the client.
           const chunk = value.subarray(offset, offset + size);
           this.sendCredit -= size;
-          this.session.sendFrame(frame(0x02, this.id, chunk));
+          this.session.sendFrame(frame(0x02, this.id, chunk), false);
           offset += size;
         }
       }
@@ -1930,12 +3242,35 @@ class Stream {
   grant(amount) {
     if (this.dead || amount <= 0) return;
     this.recvOutstanding = Math.max(0, this.recvOutstanding - amount);
-    this.session.sendFrame(windowFrame(this.id, amount));
+    this.session.sendFrame(windowFrame(this.id, amount), true);
   }
 
   kill(notify) {
     if (this.dead) return;
     this.dead = true;
+    if (this.writeTimer) {
+      clearTimeout(this.writeTimer);
+      this.writeTimer = null;
+    }
+    if (this.abortConnect) {
+      const fn = this.abortConnect;
+      this.abortConnect = null;
+      try { fn(); } catch (_) {}
+    }
+    if (this.dialWaitCancel) {
+      const fn = this.dialWaitCancel;
+      this.dialWaitCancel = null;
+      try { fn(); } catch (_) {}
+    }
+    if (this.downlinkWaitCancel) {
+      const fn = this.downlinkWaitCancel;
+      this.downlinkWaitCancel = null;
+      try { fn(); } catch (_) {}
+    }
+    if (this.pendingSocket) {
+      try { this.pendingSocket.close().catch(() => {}); } catch (_) {}
+      this.pendingSocket = null;
+    }
     this.session.streams.delete(this.id);
     this.session.remember(this.id);
     this.session.queued -= this.queuedLocal;
@@ -1960,7 +3295,7 @@ class Stream {
       try { this.socket.close().catch(() => {}); } catch (_) {}
       this.socket = null;
     }
-    if (notify && !this.session.closed) this.session.sendFrame(frame(0x03, this.id, EMPTY));
+    if (notify && !this.session.closed) this.session.sendFrame(frame(0x03, this.id, EMPTY), true);
     this.session.onStreamClosed(this.id);
   }
 }
@@ -1980,42 +3315,111 @@ class WsSession {
     this.chain = Promise.resolve();
     this.loggedMeNotice = false;
     this.lastPong = Date.now();
+    this.lastActivity = Date.now();
     this.openedAt = Date.now();
     this.bytesUp = 0;
     this.bytesDown = 0;
     this.streamCount = 0;
+    this.activeDials = 0;
+    this.dialWaiters = [];
+    this.subrequestsUsed = 0;
+    this.budgetExhausted = false;
     STATS.sessions++;
     STATS.sessionsActive++;
+    if (laneId) STATS.wsLanesOpened++;
+    else STATS.wsMuxOpened++;
     logEvent("session_open", `lane=${laneId} carrier=${cfg.carrier}`);
 
-    // Periodic KeepAlive Heartbeat (every 25s)
-    // Prevents Cloudflare 100s idle disconnect and ISP/TSPU DPI idle RST injection
-    // Lane sockets must not receive id-0 frames (the bridge rejects cross-lane ids);
-    // MTProto's own pings keep a lane busy.
-    this.keepAliveTimer = laneId ? null : setInterval(() => {
-      if (this.closed || !this.ws || this.ws.readyState !== 1) {
-        if (this.keepAliveTimer) clearInterval(this.keepAliveTimer);
-        return;
+    // Multiplexed WS: 25s server keepalive PING + 90s watchdog.
+    // Lane WS: server never emits unsolicited id=0 frames (preserving strict
+    // tproxy-lane-v1 compatibility); instead replies to bridge PINGs and runs
+    // a 120s idle watchdog so abandoned half-open lanes release resources.
+    this.keepAliveTimer = laneId
+      ? setInterval(() => {
+          if (this.closed || !this.ws || this.ws.readyState !== 1) {
+            if (this.keepAliveTimer) clearInterval(this.keepAliveTimer);
+            return;
+          }
+          if (Date.now() - this.lastActivity > 120000) {
+            this.shutdown("lane idle watchdog");
+          }
+        }, 30000)
+      : setInterval(() => {
+          if (this.closed || !this.ws || this.ws.readyState !== 1) {
+            if (this.keepAliveTimer) clearInterval(this.keepAliveTimer);
+            return;
+          }
+          if (Date.now() - Math.max(this.lastPong, this.lastActivity) > 90000) {
+            this.shutdown("pong watchdog");
+            return;
+          }
+          try {
+            const pingPayload = new Uint8Array(4);
+            new DataView(pingPayload.buffer).setUint32(0, Math.floor(Date.now() / 1000), false);
+            this.sendFrame(frame(0x05, 0, pingPayload), true);
+          } catch (_) {}
+        }, 25000);
+  }
+
+  tryReserveSubrequest() {
+    if (this.laneId) {
+      // Each lane runs in its own Worker invocation (fresh 50-subrequest budget).
+      if (this.subrequestsUsed >= WS_SUBREQ_SOFT_LIMIT) return false;
+      this.subrequestsUsed++;
+      return true;
+    }
+    if (this.subrequestsUsed >= WS_SUBREQ_SOFT_LIMIT) {
+      this.budgetExhausted = true;
+      logEvent("subreq_budget", "mux rotating ws");
+      return false;
+    }
+    this.subrequestsUsed++;
+    return true;
+  }
+
+  acquireDialSlot(stream) {
+    if (this.closed || stream.dead) return Promise.resolve(false);
+    const maxDials = this.cfg.dcMaxConcurrentDials || 4;
+    if (this.activeDials < maxDials) {
+      this.activeDials++;
+      return Promise.resolve(true);
+    }
+    return new Promise((resolve) => {
+      const waiter = {
+        done: false,
+        wake: (ok) => {
+          if (waiter.done) return;
+          waiter.done = true;
+          stream.dialWaitCancel = null;
+          resolve(ok);
+        }
+      };
+      stream.dialWaitCancel = () => {
+        const idx = this.dialWaiters.indexOf(waiter);
+        if (idx >= 0) this.dialWaiters.splice(idx, 1);
+        waiter.wake(false);
+      };
+      this.dialWaiters.push(waiter);
+    });
+  }
+
+  releaseDialSlot() {
+    this.activeDials = Math.max(0, this.activeDials - 1);
+    const maxDials = this.cfg.dcMaxConcurrentDials || 4;
+    while (!this.closed && this.activeDials < maxDials && this.dialWaiters.length) {
+      const next = this.dialWaiters.shift();
+      if (next && !next.done) {
+        this.activeDials++;
+        next.wake(true);
       }
-      // Pong watchdog: if the client stopped answering keepalives (dead network
-      // path that never sends a close frame), tear the session down instead of
-      // holding its DC sockets and subrequest budget open forever.
-      if (Date.now() - this.lastPong > 90000) {
-        this.shutdown("pong watchdog");
-        return;
-      }
-      try {
-        const pingPayload = new Uint8Array(4);
-        new DataView(pingPayload.buffer).setUint32(0, Math.floor(Date.now() / 1000), false);
-        this.sendFrame(frame(0x05, 0, pingPayload));
-      } catch (_) {}
-    }, 25000);
+    }
   }
 
   sendFrame(bytes) {
     if (this.closed) return;
     try {
       this.ws.send(bytes);
+      this.lastActivity = Date.now();
       this.bytesDown += bytes.length;
       STATS.bytesDown += bytes.length;
     } catch (_) {
@@ -2024,10 +3428,18 @@ class WsSession {
   }
 
   onStreamClosed(id) {
-    if (!this.laneId || this.closed || id !== this.laneId) return;
-    // Lane finished: close this WebSocket so the invocation (and its budget) ends.
-    this.dispose();
-    try { if (this.ws.readyState === 1) this.ws.close(1000, "done"); } catch (_) {}
+    if (this.closed) return;
+    if (this.laneId && id === this.laneId) {
+      // Lane finished: close this WebSocket so the invocation (and its budget) ends.
+      this.dispose();
+      try { if (this.ws.readyState === 1) this.ws.close(1000, "done"); } catch (_) {}
+      return;
+    }
+    if (!this.laneId && this.budgetExhausted && this.streams.size === 0) {
+      // Gracefully ask the bridge to reconnect into a fresh Worker invocation.
+      this.dispose();
+      try { if (this.ws.readyState === 1) this.ws.close(1012, "rotate"); } catch (_) {}
+    }
   }
 
   remember(id) {
@@ -2052,6 +3464,7 @@ class WsSession {
       this.shutdown();
       return;
     }
+    this.lastActivity = Date.now();
     this.bytesUp += bytes.length;
     STATS.bytesUp += bytes.length;
     const view = new DataView(data);
@@ -2072,7 +3485,7 @@ class WsSession {
       }
       const payload = bytes.subarray(offset + 8, end);
       offset = end;
-      if (this.laneId && id !== this.laneId) {
+      if (this.laneId && id !== this.laneId && !(id === 0 && (type === 0x05 || type === 0x06))) {
         this.shutdown();
         return;
       }
@@ -2088,8 +3501,17 @@ class WsSession {
           this.streams.set(id, new Stream(this, id));
           continue;
         }
+        if (this.budgetExhausted) {
+          this.sendFrame(frame(0x03, id, EMPTY), true);
+          if (this.streams.size === 0) {
+            this.dispose();
+            try { if (this.ws.readyState === 1) this.ws.close(1012, "rotate"); } catch (_) {}
+            return;
+          }
+          continue;
+        }
         if (this.streams.has(id) || this.tombstones.has(id) || this.streams.size >= this.cfg.maxStreams) {
-          this.sendFrame(frame(0x03, id, EMPTY));
+          this.sendFrame(frame(0x03, id, EMPTY), true);
           continue;
         }
         this.streams.set(id, new Stream(this, id));
@@ -2101,7 +3523,7 @@ class WsSession {
         }
         const stream = this.streams.get(id);
         if (stream) stream.feed(payload);
-        else if (!this.tombstones.has(id)) this.sendFrame(frame(0x03, id, EMPTY));
+        else if (!this.tombstones.has(id)) this.sendFrame(frame(0x03, id, EMPTY), true);
       } else if (type === 0x03) {
         // CLOSE frame
         if (id === 0 || size !== 0) {
@@ -2120,14 +3542,12 @@ class WsSession {
         if (stream) stream.addCredit(new DataView(payload.buffer, payload.byteOffset, 4).getUint32(0, false));
       } else if (type === 0x05) {
         // PING frame from client (0x05) -> respond with PONG (0x06) echoing payload.
-        // The legitimate bridge ping is 4 bytes; anything larger is refused so the
-        // proxy cannot be used as a reflection amplifier.
         if (id === 0) {
           if (size > 64) {
             this.shutdown();
             return;
           }
-          this.sendFrame(frame(0x06, 0, payload));
+          this.sendFrame(frame(0x06, 0, payload), true);
         }
       } else if (type === 0x06) {
         // PONG frame from client (0x06) -> acknowledgment of keepalive
@@ -2152,6 +3572,7 @@ class WsSession {
       clearInterval(this.keepAliveTimer);
       this.keepAliveTimer = null;
     }
+    for (const waiter of this.dialWaiters.splice(0)) waiter.wake(false);
     for (const stream of Array.from(this.streams.values())) stream.kill(false);
     this.streams.clear();
     this.tombstones.clear();
@@ -2168,30 +3589,574 @@ class WsSession {
   }
 }
 
-async function serveSession(request, cfg) {
+// ---- Optional Durable Object HTTPS Long-Polling Session (CARRIER=https) ----
+// Only used when an operator explicitly binds a SQLite Durable Object as PROXY_DO
+// AND sets CARRIER=https. Stateless Free-plan deployments never instantiate this
+// class and require zero bindings.
+function parseFrameBatchStrict(bytes) {
+  if (!bytes || !bytes.length || bytes.length > REQUEST_LIMIT) return null;
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const out = [];
+  let offset = 0;
+  let dataBytes = 0;
+  while (offset < bytes.length) {
+    if (bytes.length - offset < 8 || out.length >= 4096) return null;
+    const type = bytes[offset];
+    const id = (bytes[offset + 1] << 16) | (bytes[offset + 2] << 8) | bytes[offset + 3];
+    const size = view.getUint32(offset + 4, false);
+    const end = offset + 8 + size;
+    if (size > 1048576 || end > bytes.length) return null;
+    const payload = bytes.subarray(offset + 8, end);
+    offset = end;
+    if (type === 0x01 || type === 0x03) {
+      if (id === 0 || size !== 0) return null;
+    } else if (type === 0x02) {
+      if (id === 0 || size === 0) return null;
+      dataBytes += size;
+    } else if (type === 0x04) {
+      if (id === 0 || size !== 4) return null;
+    } else if (type === 0x05) {
+      if (id !== 0 || size > 64) return null;
+    } else if (type === 0x06) {
+      if (id !== 0 || size > 64) return null;
+    } else {
+      return null;
+    }
+    out.push({ type, id, payload });
+  }
+  if (!out.length) return null;
+  return { frames: out, dataBytes };
+}
+
+class HttpSession {
+  constructor(state, cfg, secret, tokenHash) {
+    this.state = state;
+    this.cfg = cfg;
+    this.secret = secret;
+    this.tokenHash = tokenHash;
+    this.streams = new Map();
+    this.closed = false;
+    this.queued = 0;
+    this.tombstones = new Set();
+    this.tombstoneOrder = [];
+    this.loggedMeNotice = false;
+    this.streamCount = 0;
+    this.activeDials = 0;
+    this.dialWaiters = [];
+    this.lastActivity = Date.now();
+
+    // Uplink serialization & byte-identical retry state (PROTOCOL.md)
+    this.nextUpSeq = 1;
+    this.lastUpSeq = 0;
+    this.lastUpLen = 0;
+    this.lastUpHash = null;
+    this.upInFlight = 0;
+
+    // Downlink cursor, replay cache, control headroom & newest-poll-wins state
+    this.downCursor = 0;
+    this.unackedPrevCursor = -1;
+    this.unackedBatch = null;
+    this.unackedDataBytes = 0;
+    this.downFrames = []; // { bytes, isControl, isWindow, streamId, winAmount }
+    this.downDataBytes = 0;
+    this.downlinkWaiters = [];
+    this.parkedPoll = null;
+  }
+
+  trackBackground(promise) {
+    try {
+      if (this.state && typeof this.state.waitUntil === "function") {
+        this.state.waitUntil(promise);
+      }
+    } catch (_) {}
+  }
+
+  touch() {
+    this.lastActivity = Date.now();
+    try {
+      if (this.state?.storage && typeof this.state.storage.setAlarm === "function") {
+        this.state.storage.setAlarm(this.lastActivity + (this.cfg.httpsIdleTimeoutMs || 90000)).catch(() => {});
+      }
+    } catch (_) {}
+  }
+
+  acquireDialSlot(stream) {
+    if (this.closed || stream.dead) return Promise.resolve(false);
+    const maxDials = this.cfg.dcMaxConcurrentDials || 4;
+    if (this.activeDials < maxDials) {
+      this.activeDials++;
+      return Promise.resolve(true);
+    }
+    return new Promise((resolve) => {
+      const waiter = {
+        done: false,
+        wake: (ok) => {
+          if (waiter.done) return;
+          waiter.done = true;
+          stream.dialWaitCancel = null;
+          resolve(ok);
+        }
+      };
+      stream.dialWaitCancel = () => {
+        const idx = this.dialWaiters.indexOf(waiter);
+        if (idx >= 0) this.dialWaiters.splice(idx, 1);
+        waiter.wake(false);
+      };
+      this.dialWaiters.push(waiter);
+    });
+  }
+
+  releaseDialSlot() {
+    this.activeDials = Math.max(0, this.activeDials - 1);
+    const maxDials = this.cfg.dcMaxConcurrentDials || 4;
+    while (!this.closed && this.activeDials < maxDials && this.dialWaiters.length) {
+      const next = this.dialWaiters.shift();
+      if (next && !next.done) {
+        this.activeDials++;
+        next.wake(true);
+      }
+    }
+  }
+
+  waitDownlinkReady(stream) {
+    const cap = this.cfg.httpsDownDataCap || 4194304;
+    if (this.closed || stream.dead || this.downDataBytes + this.unackedDataBytes < cap) {
+      return Promise.resolve();
+    }
+    return new Promise((resolve) => {
+      const waiter = {
+        done: false,
+        wake: () => {
+          if (waiter.done) return;
+          waiter.done = true;
+          stream.downlinkWaitCancel = null;
+          resolve();
+        }
+      };
+      stream.downlinkWaitCancel = () => {
+        const idx = this.downlinkWaiters.indexOf(waiter);
+        if (idx >= 0) this.downlinkWaiters.splice(idx, 1);
+        waiter.wake();
+      };
+      this.downlinkWaiters.push(waiter);
+    });
+  }
+
+  notifyDownlinkDrain() {
+    const cap = this.cfg.httpsDownDataCap || 4194304;
+    if (this.downDataBytes + this.unackedDataBytes >= cap) return;
+    for (const waiter of this.downlinkWaiters.splice(0)) waiter.wake();
+  }
+
+  sendFrame(bytes, isControl) {
+    if (this.closed) return;
+    // Coalesce queued WINDOW frames for the same stream while pending (PROTOCOL.md)
+    if (isControl && bytes.length === 12 && bytes[0] === 0x04) {
+      const id = (bytes[1] << 16) | (bytes[2] << 8) | bytes[3];
+      const delta = new DataView(bytes.buffer, bytes.byteOffset + 8, 4).getUint32(0, false);
+      for (let i = this.downFrames.length - 1; i >= 0; i--) {
+        const entry = this.downFrames[i];
+        if (entry.isWindow && entry.streamId === id) {
+          const nextAmt = Math.min(0xffffffff, entry.winAmount + delta);
+          entry.winAmount = nextAmt;
+          entry.bytes = windowFrame(id, nextAmt);
+          this.wakeParkedPoll();
+          return;
+        }
+      }
+      this.downFrames.push({ bytes, isControl: true, isWindow: true, streamId: id, winAmount: delta });
+      this.wakeParkedPoll();
+      return;
+    }
+    this.downFrames.push({ bytes, isControl: !!isControl, isWindow: false, streamId: 0, winAmount: 0 });
+    if (!isControl) this.downDataBytes += bytes.length;
+    this.wakeParkedPoll();
+  }
+
+  onStreamClosed() {}
+
+  remember(id) {
+    if (this.tombstones.has(id)) return;
+    if (this.tombstoneOrder.length === 4096) this.tombstones.delete(this.tombstoneOrder.shift());
+    this.tombstones.add(id);
+    this.tombstoneOrder.push(id);
+  }
+
+  wakeParkedPoll() {
+    if (!this.parkedPoll) return;
+    const poll = this.parkedPoll;
+    this.parkedPoll = null;
+    if (poll.timer) clearTimeout(poll.timer);
+    poll.resolve(this.buildDownBatchResponse(poll.cursor));
+  }
+
+  buildDownBatchResponse(ackCursor) {
+    if (this.closed) return notFound();
+    const maxBytes = this.cfg.httpsDownBatch || this.cfg.batchBytes || 524288;
+    const picked = [];
+    let totalBytes = 0;
+    let dataBytes = 0;
+    while (this.downFrames.length && picked.length < 4096) {
+      const next = this.downFrames[0];
+      if (picked.length > 0 && totalBytes + next.bytes.length > maxBytes) break;
+      this.downFrames.shift();
+      picked.push(next);
+      totalBytes += next.bytes.length;
+      if (!next.isControl) {
+        this.downDataBytes = Math.max(0, this.downDataBytes - next.bytes.length);
+        dataBytes += next.bytes.length;
+      }
+    }
+    if (!picked.length) {
+      return new Response(null, {
+        status: 204,
+        headers: { "Cache-Control": "no-store", "X-Down-Cursor": String(ackCursor) }
+      });
+    }
+    const body = new Uint8Array(totalBytes);
+    let off = 0;
+    for (const item of picked) {
+      body.set(item.bytes, off);
+      off += item.bytes.length;
+    }
+    this.downCursor++;
+    this.unackedPrevCursor = ackCursor;
+    this.unackedBatch = body;
+    this.unackedDataBytes = dataBytes;
+    STATS.bytesDown += totalBytes;
+    return new Response(body, {
+      status: 200,
+      headers: {
+        "Content-Type": "application/octet-stream",
+        "Cache-Control": "no-store",
+        "X-Down-Cursor": String(this.downCursor)
+      }
+    });
+  }
+
+  async handleUp(seq, rawBody) {
+    if (this.closed) return notFound();
+    this.touch();
+    if (this.upInFlight === seq) {
+      return new Response(null, { status: 503, headers: { "Retry-After": "1", "Cache-Control": "no-store" } });
+    }
+    const bytes = new Uint8Array(rawBody);
+    if (seq === this.lastUpSeq && this.lastUpHash) {
+      if (bytes.length !== this.lastUpLen) return notFound();
+      const digest = await sha256(bytes);
+      if (!bytesEqual(digest, this.lastUpHash)) return notFound();
+      return new Response(null, {
+        status: 204,
+        headers: { "Cache-Control": "no-store", "X-Up-Ack": String(seq) }
+      });
+    }
+    if (seq !== this.nextUpSeq) return notFound();
+    const parsed = parseFrameBatchStrict(bytes);
+    if (!parsed) {
+      this.dispose();
+      return notFound();
+    }
+    if (this.queued + parsed.dataBytes > this.cfg.maxQueued) {
+      return new Response(null, { status: 503, headers: { "Retry-After": "1", "Cache-Control": "no-store" } });
+    }
+    this.upInFlight = seq;
+    try {
+      const digest = await sha256(bytes);
+      if (this.closed) return notFound();
+      STATS.bytesUp += bytes.length;
+      for (const f of parsed.frames) {
+        if (f.type === 0x01) {
+          if (this.streams.has(f.id) || this.tombstones.has(f.id) || this.streams.size >= this.cfg.maxStreams) {
+            this.sendFrame(frame(0x03, f.id, EMPTY), true);
+            continue;
+          }
+          this.streams.set(f.id, new Stream(this, f.id));
+        } else if (f.type === 0x02) {
+          const stream = this.streams.get(f.id);
+          if (stream) stream.feed(f.payload);
+          else if (!this.tombstones.has(f.id)) this.sendFrame(frame(0x03, f.id, EMPTY), true);
+        } else if (f.type === 0x03) {
+          const stream = this.streams.get(f.id);
+          if (stream) stream.kill(false);
+        } else if (f.type === 0x04) {
+          const stream = this.streams.get(f.id);
+          if (stream) stream.addCredit(new DataView(f.payload.buffer, f.payload.byteOffset, 4).getUint32(0, false));
+        } else if (f.type === 0x05) {
+          this.sendFrame(frame(0x06, 0, f.payload), true);
+        }
+      }
+      this.lastUpSeq = seq;
+      this.lastUpLen = bytes.length;
+      this.lastUpHash = digest;
+      this.nextUpSeq = seq + 1;
+      return new Response(null, {
+        status: 204,
+        headers: { "Cache-Control": "no-store", "X-Up-Ack": String(seq) }
+      });
+    } finally {
+      if (this.upInFlight === seq) this.upInFlight = 0;
+    }
+  }
+
+  handleDown(reqCursor) {
+    if (this.closed) return Promise.resolve(notFound());
+    this.touch();
+    // Case 1: client repeats previous cursor -> replay unacknowledged batch byte-for-byte
+    if (this.unackedBatch && reqCursor === this.unackedPrevCursor) {
+      if (this.parkedPoll) {
+        const old = this.parkedPoll;
+        this.parkedPoll = null;
+        if (old.timer) clearTimeout(old.timer);
+        old.resolve(new Response(null, { status: 204, headers: { "Cache-Control": "no-store", "X-Down-Cursor": String(old.cursor) } }));
+      }
+      return Promise.resolve(new Response(this.unackedBatch, {
+        status: 200,
+        headers: {
+          "Content-Type": "application/octet-stream",
+          "Cache-Control": "no-store",
+          "X-Down-Cursor": String(this.downCursor)
+        }
+      }));
+    }
+    // Case 2: client acknowledges current cursor
+    if (reqCursor !== this.downCursor) return Promise.resolve(notFound());
+    if (this.unackedBatch) {
+      this.unackedBatch = null;
+      this.unackedPrevCursor = -1;
+      this.unackedDataBytes = 0;
+      this.notifyDownlinkDrain();
+    }
+    // Newest-poll-wins: release older parked poll harmlessly with 204
+    if (this.parkedPoll) {
+      const old = this.parkedPoll;
+      this.parkedPoll = null;
+      if (old.timer) clearTimeout(old.timer);
+      old.resolve(new Response(null, { status: 204, headers: { "Cache-Control": "no-store", "X-Down-Cursor": String(old.cursor) } }));
+    }
+    if (this.downFrames.length > 0) {
+      return Promise.resolve(this.buildDownBatchResponse(reqCursor));
+    }
+    return new Promise((resolve) => {
+      const poll = {
+        cursor: reqCursor,
+        resolve,
+        timer: setTimeout(() => {
+          if (this.parkedPoll === poll) {
+            this.parkedPoll = null;
+            resolve(new Response(null, { status: 204, headers: { "Cache-Control": "no-store", "X-Down-Cursor": String(reqCursor) } }));
+          }
+        }, this.cfg.httpsPollTimeoutMs || 25000)
+      };
+      this.parkedPoll = poll;
+    });
+  }
+
+  dispose() {
+    if (this.closed) return;
+    this.closed = true;
+    if (this.parkedPoll) {
+      const old = this.parkedPoll;
+      this.parkedPoll = null;
+      if (old.timer) clearTimeout(old.timer);
+      old.resolve(notFound());
+    }
+    for (const waiter of this.dialWaiters.splice(0)) waiter.wake(false);
+    for (const waiter of this.downlinkWaiters.splice(0)) waiter.wake();
+    for (const stream of Array.from(this.streams.values())) stream.kill(false);
+    this.streams.clear();
+    this.tombstones.clear();
+    this.tombstoneOrder.length = 0;
+    this.downFrames.length = 0;
+    this.downDataBytes = 0;
+    this.unackedBatch = null;
+    this.unackedDataBytes = 0;
+    this.queued = 0;
+    try {
+      if (this.state?.storage && typeof this.state.storage.deleteAlarm === "function") {
+        this.state.storage.deleteAlarm().catch(() => {});
+      }
+    } catch (_) {}
+  }
+}
+
+export class ProxySessionDO {
+  constructor(state, env) {
+    this.state = state;
+    this.env = env;
+    this.session = null;
+  }
+
+  async alarm() {
+    if (!this.session || this.session.closed) {
+      this.session = null;
+      return;
+    }
+    const idleLimit = this.session.cfg.httpsIdleTimeoutMs || 90000;
+    const elapsed = Date.now() - this.session.lastActivity;
+    if (elapsed >= idleLimit - 5000) {
+      this.session.dispose();
+      this.session = null;
+    } else if (this.state?.storage && typeof this.state.storage.setAlarm === "function") {
+      try { await this.state.storage.setAlarm(this.session.lastActivity + idleLimit); } catch (_) {}
+    }
+  }
+
+  async fetch(request, init) {
+    try {
+      const req = request instanceof Request ? request : new Request(request, init);
+      const url = new URL(req.url);
+      const auth = req.headers.get("authorization") || "";
+      if (!auth.startsWith("Bearer ") || auth.length <= 7) return notFound();
+      const token = auth.substring(7);
+      const cfg = await getRuntime(this.env);
+      if (!cfg) return notFound();
+      const verified = await verifyToken(cfg, token, TOKEN_KIND_SESSION);
+      if (!verified) return notFound();
+      if ((verified.mode === 1 || verified.mode === 2) && !cfg.acceptGenerated) return notFound();
+      const tokenHash = await sha256(te.encode(token));
+
+      if (url.pathname === "/init" && req.method === "POST") {
+        if (this.session && !this.session.closed) {
+          if (bytesEqual(this.session.tokenHash, tokenHash)) {
+            this.session.touch();
+            return new Response(null, { status: 204, headers: { "Cache-Control": "no-store" } });
+          }
+          return notFound();
+        }
+        const host = String(req.headers.get("x-proxy-host") || "").toLowerCase();
+        const port = parseValidPort(req.headers.get("x-proxy-port") || "");
+        const secret = await resolveSecretForMode(cfg, verified.mode, host, port);
+        if (!secret) return notFound();
+        const effective = resolveProfileConfig(cfg, verified.mode);
+        this.session = new HttpSession(this.state, effective, secret, tokenHash);
+        this.session.touch();
+        return new Response(null, { status: 204, headers: { "Cache-Control": "no-store" } });
+      }
+
+      if (url.pathname === "/session" && req.method === "DELETE") {
+        if (this.session && bytesEqual(this.session.tokenHash, tokenHash)) {
+          this.session.dispose();
+          this.session = null;
+        }
+        return new Response(null, { status: 204, headers: { "Cache-Control": "no-store" } });
+      }
+
+      if (!this.session || this.session.closed || !bytesEqual(this.session.tokenHash, tokenHash)) {
+        return notFound();
+      }
+
+      if (url.pathname === "/up" && req.method === "POST") {
+        const seqStr = (req.headers.get("x-up-seq") || "").trim();
+        if (!/^[1-9][0-9]{0,12}$/.test(seqStr)) return notFound();
+        const body = await req.arrayBuffer();
+        return await this.session.handleUp(parseInt(seqStr, 10), body);
+      }
+
+      if (url.pathname === "/down" && req.method === "POST") {
+        const curStr = (req.headers.get("x-down-cursor") || "").trim();
+        if (!/^(0|[1-9][0-9]{0,12})$/.test(curStr)) return notFound();
+        return await this.session.handleDown(parseInt(curStr, 10));
+      }
+
+      return notFound();
+    } catch (error) {
+      reportError("do_fetch", error);
+      return notFound();
+    }
+  }
+}
+
+async function serveSession(request, env, cfg, host, port) {
   const auth = request.headers.get("authorization") || "";
-  if (!auth.startsWith("Bearer ") || auth.length <= 7) return notFound();
+  if ((request.method === "GET" || request.method === "HEAD") && !auth) {
+    return await decoy(cfg.decoyUrl, request.method, "/", host);
+  }
+  if (!auth.startsWith("Bearer ") || auth.length <= 7) {
+    STATS.sessionCreateRejects++;
+    return notFound();
+  }
   const token = auth.substring(7);
   if (request.method === "DELETE") {
-    if (!(await verifyToken(cfg, token, TOKEN_KIND_SESSION))) return notFound();
+    const verified = await verifyToken(cfg, token, TOKEN_KIND_SESSION);
+    if (!verified) return notFound();
+    if (cfg.hasDoBinding && env?.PROXY_DO) {
+      try {
+        const stub = env.PROXY_DO.get(env.PROXY_DO.idFromName("s:" + bytesToHex(verified.nonce)));
+        await stub.fetch(new Request("https://do.internal/session", {
+          method: "DELETE",
+          headers: { Authorization: "Bearer " + token }
+        }));
+      } catch (_) {}
+    }
     return new Response(null, { status: 204, headers: { "Cache-Control": "no-store" } });
   }
-  if (request.method !== "POST") return notFound();
-  if (request.headers.get("cookie")) return notFound();
-  if ((request.headers.get("content-type") || "").toLowerCase() !== "application/octet-stream") return notFound();
+  if (request.method !== "POST") {
+    STATS.sessionCreateRejects++;
+    return notFound();
+  }
+  if (request.headers.get("cookie")) {
+    STATS.sessionCreateRejects++;
+    return notFound();
+  }
+  if ((request.headers.get("content-type") || "").toLowerCase() !== "application/octet-stream") {
+    STATS.sessionCreateRejects++;
+    return notFound();
+  }
   // The handshake body is a fixed 9 bytes. Reject an oversized declared body
-  // before buffering it: isolate memory (128 MB) is shared by every session
-  // running in the isolate, so unbounded reads are a memory-DoS vector.
+  // before buffering it to protect isolate memory (128 MB shared).
   const declaredLength = parseInt(request.headers.get("content-length") || "", 10);
-  if (Number.isFinite(declaredLength) && declaredLength > 4096) return notFound();
+  if (Number.isFinite(declaredLength) && declaredLength > 4096) {
+    STATS.sessionCreateRejects++;
+    return notFound();
+  }
   const verified = await verifyToken(cfg, token, TOKEN_KIND_BOOTSTRAP);
-  if (!verified) return notFound();
-  if ((verified.mode === 1 || verified.mode === 2) && !cfg.acceptGenerated) return notFound();
+  if (!verified) {
+    STATS.sessionCreateRejects++;
+    logEvent("session_reject", "bad or expired bootstrap token");
+    return notFound();
+  }
+  if ((verified.mode === 1 || verified.mode === 2) && !cfg.acceptGenerated) {
+    STATS.sessionCreateRejects++;
+    return notFound();
+  }
   const body = new Uint8Array(await request.arrayBuffer());
-  if (body.length !== 9) return notFound();
-  if (body[0] !== 0x10 || body[1] !== 0 || body[2] !== 0 || body[3] !== 0) return notFound();
-  if (body[4] !== 0 || body[5] !== 0 || body[6] !== 0 || body[7] !== 1 || body[8] !== 1) return notFound();
-  const sessionToken = await issueToken(cfg, TOKEN_KIND_SESSION, cfg.sessionTtl, verified.mode);
+  if (body.length !== 9) {
+    STATS.sessionCreateRejects++;
+    return notFound();
+  }
+  if (body[0] !== 0x10 || body[1] !== 0 || body[2] !== 0 || body[3] !== 0) {
+    STATS.sessionCreateRejects++;
+    return notFound();
+  }
+  if (body[4] !== 0 || body[5] !== 0 || body[6] !== 0 || body[7] !== 1 || body[8] !== 1) {
+    STATS.sessionCreateRejects++;
+    return notFound();
+  }
+  const effective = resolveProfileConfig(cfg, verified.mode);
+  const sessionToken = await issueToken(cfg, TOKEN_KIND_SESSION, effective.sessionTtl, verified.mode);
+
+  if (effective.carrier === "https" && cfg.hasDoBinding && env?.PROXY_DO) {
+    const parsedSession = await verifyToken(cfg, sessionToken, TOKEN_KIND_SESSION);
+    if (!parsedSession) return notFound();
+    const stub = env.PROXY_DO.get(env.PROXY_DO.idFromName("s:" + bytesToHex(parsedSession.nonce)));
+    const initRes = await stub.fetch(new Request("https://do.internal/init", {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer " + sessionToken,
+        "X-Proxy-Host": host,
+        "X-Proxy-Port": port || "443"
+      }
+    }));
+    if (initRes.status !== 204) {
+      STATS.sessionCreateRejects++;
+      return initRes.status === 503
+        ? new Response(null, { status: 503, headers: { "Retry-After": "1", "Cache-Control": "no-store" } })
+        : notFound();
+    }
+    STATS.httpsSessions++;
+  }
+
+  STATS.sessionCreateOk++;
   return new Response(WELCOME, {
     status: 200,
     headers: {
@@ -2199,14 +4164,89 @@ async function serveSession(request, cfg) {
       "Cache-Control": "no-store",
       "X-Session-Token": sessionToken,
       "X-Down-Cursor": "0",
-      "X-Carrier-Mode": cfg.carrier
+      "X-Carrier-Mode": effective.carrier
     }
   });
 }
 
+async function serveHttpsCarrier(request, env, cfg, direction, host) {
+  const auth = request.headers.get("authorization") || "";
+  if (!auth.startsWith("Bearer ") || auth.length <= 7) {
+    return await decoy(cfg.decoyUrl, request.method, "/", host);
+  }
+  const token = auth.substring(7);
+  const verified = await verifyToken(cfg, token, TOKEN_KIND_SESSION);
+  if (!verified) {
+    return await decoy(cfg.decoyUrl, request.method, "/", host);
+  }
+  if (!cfg.hasDoBinding || !env?.PROXY_DO) {
+    if (direction === "up") STATS.httpsUpRejects++;
+    else STATS.httpsDownRejects++;
+    return notFound();
+  }
+  if (request.method !== "POST" || request.headers.get("cookie")) {
+    if (direction === "up") STATS.httpsUpRejects++;
+    else STATS.httpsDownRejects++;
+    return notFound();
+  }
+  const stub = env.PROXY_DO.get(env.PROXY_DO.idFromName("s:" + bytesToHex(verified.nonce)));
+  if (direction === "up") {
+    if ((request.headers.get("content-type") || "").toLowerCase() !== "application/octet-stream") {
+      STATS.httpsUpRejects++;
+      return notFound();
+    }
+    const seqStr = (request.headers.get("x-up-seq") || "").trim();
+    if (!/^[1-9][0-9]{0,12}$/.test(seqStr)) {
+      STATS.httpsUpRejects++;
+      return notFound();
+    }
+    const declaredLength = parseInt(request.headers.get("content-length") || "", 10);
+    if (Number.isFinite(declaredLength) && declaredLength > REQUEST_LIMIT) {
+      STATS.httpsUpRejects++;
+      return notFound();
+    }
+    const rawBody = await request.arrayBuffer();
+    if (rawBody.byteLength === 0 || rawBody.byteLength > REQUEST_LIMIT) {
+      STATS.httpsUpRejects++;
+      return notFound();
+    }
+    const res = await stub.fetch(new Request("https://do.internal/up", {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer " + token,
+        "Content-Type": "application/octet-stream",
+        "X-Up-Seq": seqStr
+      },
+      body: rawBody
+    }));
+    if (res.status === 204) STATS.httpsUpOk++;
+    else STATS.httpsUpRejects++;
+    return res;
+  }
+  const curStr = (request.headers.get("x-down-cursor") || "").trim();
+  if (!/^(0|[1-9][0-9]{0,12})$/.test(curStr)) {
+    STATS.httpsDownRejects++;
+    return notFound();
+  }
+  const res = await stub.fetch(new Request("https://do.internal/down", {
+    method: "POST",
+    headers: {
+      Authorization: "Bearer " + token,
+      "X-Down-Cursor": curStr
+    }
+  }));
+  if (res.status === 200 || res.status === 204) STATS.httpsDownOk++;
+  else STATS.httpsDownRejects++;
+  return res;
+}
+
 async function serveWebSocket(request, cfg, host, port) {
+  const upgrade = (request.headers.get("upgrade") || "").toLowerCase();
+  if ((request.method === "GET" || request.method === "HEAD") && upgrade !== "websocket" && !request.headers.get("sec-websocket-protocol") && !request.headers.get("authorization")) {
+    return await decoy(cfg.decoyUrl, request.method, "/", host);
+  }
   if (request.method !== "GET") return notFound();
-  if ((request.headers.get("upgrade") || "").toLowerCase() !== "websocket") return notFound();
+  if (upgrade !== "websocket") return notFound();
   if (request.headers.get("authorization")) return notFound();
   const offered = (request.headers.get("sec-websocket-protocol") || "").split(",").map((value) => value.trim()).filter(Boolean);
   if (offered.length !== 1) return notFound();
@@ -2227,22 +4267,20 @@ async function serveWebSocket(request, cfg, host, port) {
   }
   const verified = await verifyToken(cfg, token, TOKEN_KIND_SESSION);
   if (!verified) {
-    // A real WebSocket upgrade with an invalid/expired token is either a
-    // forgery attempt or a client whose token expired - worth a log line.
     STATS.wsRejects++;
     logEvent("ws_reject", "invalid or expired session token");
     return notFound();
   }
-  if ((verified.mode === 1 || verified.mode === 2) && !cfg.acceptGenerated) return notFound();
-  let secret = cfg.base;
-  if (verified.mode >= PORT_MODE_BASE && verified.mode < PORT_MODE_BASE + HTTPS_PORTS.length) {
-    const portNum = HTTPS_PORTS[verified.mode - PORT_MODE_BASE];
-    secret = cfg.portSecrets?.[portNum]?.secret || cfg.base;
-  } else if (verified.mode === 1 || verified.mode === 2) {
-    const label = verified.mode === 2 && port && port !== "443" && port !== "80" ? `${host}:${port}` : host;
-    secret = await deriveSecret(cfg, label);
+  if ((verified.mode === 1 || verified.mode === 2) && !cfg.acceptGenerated) {
+    STATS.wsRejects++;
+    return notFound();
   }
-  if (!secret) return notFound();
+  const secret = await resolveSecretForMode(cfg, verified.mode, host, port);
+  if (!secret) {
+    STATS.wsRejects++;
+    return notFound();
+  }
+  const effective = resolveProfileConfig(cfg, verified.mode);
   const pair = new WebSocketPair();
   const client = pair[0];
   const server = pair[1];
@@ -2250,17 +4288,17 @@ async function serveWebSocket(request, cfg, host, port) {
   server.accept();
   let session;
   try {
-    session = new WsSession(server, cfg, secret, laneId);
+    session = new WsSession(server, effective, secret, laneId);
   } catch (error) {
-    reportError("ws session", error);
+    reportError("ws session", error, [cfg.adminKey, cfg.secretHex]);
     try { server.close(1011, "error"); } catch (_) {}
     return new Response(null, { status: 101, webSocket: client, headers: { "Sec-WebSocket-Protocol": protocol } });
   }
   server.addEventListener("message", (event) => {
-    try { session.enqueue(event.data); } catch (error) { reportError("ws message", error); try { session.shutdown("handler error"); } catch (_) {} }
+    try { session.enqueue(event.data); } catch (error) { reportError("ws message", error, [cfg.adminKey, cfg.secretHex]); try { session.shutdown("handler error"); } catch (_) {} }
   });
-  server.addEventListener("close", () => { try { session.dispose(); } catch (error) { reportError("ws close", error); } });
-  server.addEventListener("error", () => { try { session.dispose(); } catch (error) { reportError("ws error", error); } });
+  server.addEventListener("close", () => { try { session.dispose(); } catch (error) { reportError("ws close", error, [cfg.adminKey, cfg.secretHex]); } });
+  server.addEventListener("error", () => { try { session.dispose(); } catch (error) { reportError("ws error", error, [cfg.adminKey, cfg.secretHex]); } });
   return new Response(null, {
     status: 101,
     webSocket: client,
@@ -2270,13 +4308,41 @@ async function serveWebSocket(request, cfg, host, port) {
   });
 }
 
-// Records an unexpected error without ever throwing itself. Visible in the
-// Cloudflare dashboard (Workers -> Logs) and on the admin /status page.
-function reportError(where, error) {
+// Coarse route classifier used in error logging so raw paths (which may contain
+// ADMIN_KEY) and query strings (which may contain ?bridge= or ?key=) are never logged.
+function classifyRoute(request, env) {
   try {
-    const message = error && error.stack ? String(error.stack) : String(error);
-    console.error("[proxygosha] " + where + ": " + message);
-    logEvent("error", where + ": " + (error && error.message ? error.message : message));
+    const url = new URL(request.url);
+    const p = url.pathname;
+    const norm = (v) => (typeof v === "string" && v.trim() ? (v.trim().startsWith("/") ? v.trim() : "/" + v.trim()) : "");
+    if (p === "/") return url.searchParams.has("bridge") ? "bridge" : "root";
+    if (p === "/api/v1/session" || p === norm(env?.SESSION_PATH)) return "session";
+    if (p === "/api/v1/ws" || p === norm(env?.WS_PATH)) return "ws";
+    if (p === "/api/v1/up" || p === norm(env?.UP_PATH)) return "up";
+    if (p === "/api/v1/down" || p === norm(env?.DOWN_PATH)) return "down";
+    if (p === "/setup") return "setup";
+    const adminKey = typeof env?.ADMIN_KEY === "string" ? env.ADMIN_KEY.trim() : "";
+    if (adminKey.length >= 16) {
+      let decoded = "";
+      try { decoded = decodeURIComponent(p.slice(1)).replace(/\/$/, ""); } catch (_) {}
+      if (decoded && safeEqual(decoded, adminKey)) return "panel";
+      if (decoded && safeEqual(decoded, adminKey + "/status")) return "status";
+      if (decoded && safeEqual(decoded, adminKey + "/settings")) return "settings";
+    }
+    return "other";
+  } catch (_) {
+    return "unknown";
+  }
+}
+
+// Records an unexpected error without ever throwing itself or exposing secrets.
+function reportError(where, error, secrets) {
+  try {
+    const rawMsg = error && error.message ? String(error.message) : String(error || "error");
+    const safeWhere = sanitizeDetail(where, secrets);
+    const safeMsg = sanitizeDetail(rawMsg, secrets);
+    console.error("[proxygosha] " + safeWhere + ": " + safeMsg);
+    logEvent("error", safeWhere + ": " + safeMsg, secrets);
   } catch (_) {}
 }
 
@@ -2286,7 +4352,7 @@ async function safeFallback(env, request) {
     const method = request && typeof request.method === "string" ? request.method : "GET";
     return await decoy(typeof env?.DECOY_URL === "string" ? env.DECOY_URL.trim() : "", method);
   } catch (error) {
-    reportError("fallback", error);
+    reportError("fallback", error, [env?.ADMIN_KEY, env?.SECRET]);
   }
   try {
     return new Response(DECOY_HTML, { status: 200, headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-cache" } });
@@ -2298,77 +4364,127 @@ async function safeFallback(env, request) {
 // Every route handler is awaited here, so a rejected promise from any of them
 // lands in the fetch() catch below instead of escaping as an uncaught exception.
 async function handleRequest(request, env, ctx) {
-      const url = new URL(request.url);
-      const host = requestHost(request, url);
-      const rawHost = String(request.headers.get("host") || url.host || "");
-      const portMatch = /:([0-9]+)$/.exec(rawHost);
-      const port = portMatch ? portMatch[1] : (url.port || "");
+  const url = new URL(request.url);
+  const host = requestHost(request, url);
+  const rawHost = String(request.headers.get("host") || url.host || "");
+  const portMatch = /:([0-9]+)$/.exec(rawHost);
+  const port = parseValidPort(portMatch ? portMatch[1] : (url.port || ""));
 
-      const cfg = await getRuntime(env);
-      const lang = url.searchParams.get("lang") === "fa" ? "fa" : "en";
-      // Not configured yet: the step-by-step setup page is served on "/" only.
-      // Every other path or method answers 404 so an unconfigured worker does
-      // not advertise what it is to scanners probing random paths.
-      if (!cfg) {
-        if (url.pathname === "/") return await serveSetup(host, env, lang, request.method);
-        return notFound();
-      }
-      // Configured with SECRET only (older setup, no ADMIN_KEY yet): the site stays
-      // camouflaged, but /setup explains how to add ADMIN_KEY. It reveals no secret.
-      if (!cfg.adminKey && url.pathname === "/setup") return await serveSetup(host, env, lang, request.method);
+  const cfg = await getRuntime(env);
+  const lang = url.searchParams.get("lang") === "fa" ? "fa" : "en";
+  // Not configured yet: the step-by-step setup page is served on "/" only.
+  // Every other path or method answers 404 so an unconfigured worker does
+  // not advertise what it is to scanners probing random paths.
+  if (!cfg) {
+    if (url.pathname === "/") return await serveSetup(host, env, lang, request.method);
+    return notFound();
+  }
+  // Configured with SECRET only (older setup, no ADMIN_KEY yet): the site stays
+  // camouflaged, but /setup explains how to add ADMIN_KEY. It reveals no secret.
+  if (!cfg.adminKey && url.pathname === "/setup") return await serveSetup(host, env, lang, request.method);
 
-      // Admin panel: https://host/<ADMIN_KEY>  (or legacy ?create-secret&key=<ADMIN_KEY>)
-      // Admin status & logs: https://host/<ADMIN_KEY>/status  (?probe=1 runs a DC check)
-      if (request.method === "GET") {
-        const route = panelRoute(url, cfg);
-        if (route === "status") return await serveStatus(cfg, host, lang, url.searchParams.get("probe") === "1");
-        if (route === "panel") return await servePanel(cfg, host, port, lang);
-      }
-
-      // Legacy per-domain secret generator (ACCEPT_GENERATED); also gated by ADMIN_KEY.
-      const label = generatorLabel(url);
-      if (label !== null) {
-        if (!cfg.generatorEnabled || !cfg.adminKey || !label || !safeEqual(url.searchParams.get("key") || "", cfg.adminKey)) {
-          return await decoy(cfg.decoyUrl, request.method);
+  // Admin panel: https://host/<ADMIN_KEY>  (or legacy ?create-secret&key=<ADMIN_KEY>)
+  // Admin status & logs: https://host/<ADMIN_KEY>/status  (?probe=1 runs a DC check)
+  // Live global settings: POST https://host/<ADMIN_KEY>/settings (persisted in optional SETTINGS_KV)
+  const route = panelRoute(url, cfg);
+  if (route === "settings" && request.method === "POST") {
+    const freshCfg = (await getRuntime(env, true)) || cfg;
+    return await handleSaveSettings(request, env, freshCfg, host, url);
+  }
+  if (request.method === "GET") {
+    if (route === "settings") {
+      return new Response(null, {
+        status: 303,
+        headers: {
+          Location: "/" + encodeURIComponent(cfg.adminKey) + (lang === "fa" ? "?lang=fa" : ""),
+          "Cache-Control": "no-store",
+          "Referrer-Policy": "no-referrer"
         }
-        return await serveSecret(cfg, host, label, port);
-      }
+      });
+    }
+    if (route === "status") {
+      const freshCfg = (await getRuntime(env, true)) || cfg;
+      return await serveStatus(freshCfg, host, lang, url.searchParams.get("probe") === "1", request.cf);
+    }
+    if (route === "panel") {
+      const freshCfg = (await getRuntime(env, true)) || cfg;
+      return await servePanel(freshCfg, host, port, lang, url.searchParams.get("saved") || "");
+    }
+  }
 
-      // Active Probing Defense & Authentic Web Assets (GFW / TSPU scanner camouflage)
-      if (url.pathname === "/robots.txt") {
-        return new Response(request.method === "HEAD" ? null : "User-agent: *\nAllow: /\nDisallow: /api/\n", {
-          status: 200,
-          headers: { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "public, max-age=86400" }
-        });
-      }
-      if (url.pathname === "/favicon.ico") {
-        const svgIcon = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="6" fill="#1a1a1a"/><text x="50%" y="54%" dominant-baseline="middle" text-anchor="middle" font-family="system-ui,sans-serif" font-weight="800" font-size="14" fill="#fff" letter-spacing="2">LV</text></svg>`;
-        return new Response(request.method === "HEAD" ? null : svgIcon, {
-          status: 200,
-          headers: { "Content-Type": "image/svg+xml", "Cache-Control": "public, max-age=86400", "X-Content-Type-Options": "nosniff" }
-        });
-      }
-      if (url.pathname === "/health" || url.pathname === "/status") {
-        const json = JSON.stringify({ status: "operational", store: "LUXVEIL", region: "global", uptime: "99.99%", timestamp: Math.floor(Date.now() / 1000) });
-        return new Response(request.method === "HEAD" ? null : json, {
-          status: 200,
-          headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-cache" }
-        });
-      }
+  // Legacy per-domain secret generator (ACCEPT_GENERATED); also gated by ADMIN_KEY.
+  const label = generatorLabel(url);
+  if (label !== null) {
+    if (!cfg.generatorEnabled || !cfg.adminKey || !label || !safeEqual(url.searchParams.get("key") || "", cfg.adminKey)) {
+      return await decoy(cfg.decoyUrl, request.method, "/", host);
+    }
+    return await serveSecret(cfg, host, label, port);
+  }
 
-      if (!hostAllowed(cfg, host)) return await decoy(cfg.decoyUrl, request.method);
-      if (url.pathname === "/" && request.method === "GET") {
-        const bridges = url.searchParams.getAll("bridge");
-        if (bridges.length === 0) return await decoy(cfg.decoyUrl, request.method);
-        const keys = Array.from(url.searchParams.keys());
-        if (keys.length !== 1 || keys[0] !== "bridge" || bridges.length !== 1) return notFound();
-        const mode = await bridgeMode(cfg, host, bridges[0], port);
-        if (mode < 0) return notFound();
-        return await serveBridge(cfg, host, mode, port);
+  // Public web assets: when DECOY_URL is configured, proxy the matching path from
+  // the real decoy site instead of serving hardcoded LUXVEIL assets.
+  if (url.pathname === "/robots.txt") {
+    if (cfg.decoyUrl) return await decoy(cfg.decoyUrl, request.method, "/robots.txt", host);
+    return new Response(request.method === "HEAD" ? null : "User-agent: *\nAllow: /\n", {
+      status: 200,
+      headers: { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "public, max-age=86400" }
+    });
+  }
+  if (url.pathname === "/favicon.ico") {
+    if (cfg.decoyUrl) return await decoy(cfg.decoyUrl, request.method, "/favicon.ico", host);
+    const svgIcon = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="6" fill="#1a1a1a"/><text x="50%" y="54%" dominant-baseline="middle" text-anchor="middle" font-family="system-ui,sans-serif" font-weight="800" font-size="14" fill="#fff" letter-spacing="2">LV</text></svg>`;
+    return new Response(request.method === "HEAD" ? null : svgIcon, {
+      status: 200,
+      headers: { "Content-Type": "image/svg+xml", "Cache-Control": "public, max-age=86400", "X-Content-Type-Options": "nosniff" }
+    });
+  }
+
+  if (!hostAllowed(cfg, host)) {
+    if (url.pathname === "/" && url.searchParams.has("bridge")) {
+      STATS.bridgeRejects++;
+      logEvent("bridge_reject", `host not allowed: ${host}`);
+    }
+    return await decoy(cfg.decoyUrl, request.method, url.pathname, host);
+  }
+  if (url.pathname === "/" && request.method === "GET") {
+    const bridges = url.searchParams.getAll("bridge");
+    if (bridges.length === 0) {
+      STATS.pageHits++;
+      return await decoy(cfg.decoyUrl, request.method, "/", host);
+    }
+    const keys = Array.from(url.searchParams.keys());
+    if (keys.length !== 1 || keys[0] !== "bridge" || bridges.length !== 1) {
+      STATS.bridgeRejects++;
+      logEvent("bridge_reject", "non-canonical bridge query");
+      // Fail locally with 404 only if an authentic capability is present so it is
+      // never forwarded to DECOY_URL; unauthenticated probes see the public site.
+      for (const b of bridges) {
+        if (await bridgeMode(cfg, host, b, port) >= 0) return notFound();
       }
-      if (url.pathname === cfg.sessionPath || url.pathname === "/api/v1/session") return await serveSession(request, cfg);
-      if (url.pathname === cfg.wsPath || url.pathname === "/api/v1/ws") return await serveWebSocket(request, cfg, host, port);
-      return await decoy(cfg.decoyUrl, request.method);
+      return await decoy(cfg.decoyUrl, request.method, "/", host);
+    }
+    const mode = await bridgeMode(cfg, host, bridges[0], port);
+    if (mode < 0) {
+      STATS.bridgeRejects++;
+      logEvent("bridge_reject", `capability mismatch host=${host}`);
+      return await decoy(cfg.decoyUrl, request.method, "/", host);
+    }
+    return await serveBridge(cfg, host, mode, port);
+  }
+  if (url.pathname === cfg.sessionPath || url.pathname === "/api/v1/session") {
+    return await serveSession(request, env, cfg, host, port);
+  }
+  if (url.pathname === cfg.wsPath || url.pathname === "/api/v1/ws") {
+    return await serveWebSocket(request, cfg, host, port);
+  }
+  if (url.pathname === cfg.upPath || url.pathname === "/api/v1/up") {
+    return await serveHttpsCarrier(request, env, cfg, "up", host);
+  }
+  if (url.pathname === cfg.downPath || url.pathname === "/api/v1/down") {
+    return await serveHttpsCarrier(request, env, cfg, "down", host);
+  }
+  STATS.pageHits++;
+  return await decoy(cfg.decoyUrl, request.method, url.pathname, host);
 }
 
 export default {
@@ -2376,7 +4492,7 @@ export default {
     try {
       return await handleRequest(request, env, ctx);
     } catch (error) {
-      reportError("fetch " + (request && request.method) + " " + (() => { try { return new URL(request.url).pathname; } catch (_) { return "?"; } })(), error);
+      reportError("fetch " + (request && request.method) + " " + classifyRoute(request, env), error, [env?.ADMIN_KEY, env?.SECRET]);
       return safeFallback(env, request);
     }
   }
